@@ -395,6 +395,9 @@ MHD_set_connection_value (struct MHD_Connection *connection,
   pos->value = (char *) value;
   pos->kind = kind;
   pos->next = NULL;
+
+  printf("%s kind=%d key=[%s] value=[%s]\n", __func__, kind, key, value);
+  
   /* append 'pos' to the linked list of headers */
   if (NULL == connection->headers_received_tail)
     {

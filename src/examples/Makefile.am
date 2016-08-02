@@ -60,7 +60,8 @@ endif
 minimal_example_SOURCES = \
  minimal_example.c
 minimal_example_LDADD = \
- $(top_builddir)/src/microhttpd/libmicrohttpd.la
+ $(top_builddir)/src/microhttpd/libmicrohttpd.la \
+ -ljson-c -luriparser 
 
 timeout_SOURCES = \
  timeout.c

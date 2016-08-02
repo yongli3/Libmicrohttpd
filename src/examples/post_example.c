@@ -549,6 +549,8 @@ create_response (void *cls,
   int ret;
   unsigned int i;
 
+  printf("%s method=%s upload_data=%s\n", __func__, method, upload_data);
+
   request = *ptr;
   if (NULL == request)
     {
