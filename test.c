@@ -2,6 +2,7 @@
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
+#include <syslog.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -47,18 +48,19 @@ struct curl_fetch_st {
 };
 
 /* callback for curl fetch */
-size_t curl_callback(void *contents, size_t size, size_t nmemb, void *userp) {
+static size_t curl_callback(void *contents, size_t size, size_t nmemb, void *userp) 
+{
     size_t realsize = size * nmemb;                             /* calculate buffer size */
     struct curl_fetch_st *p = (struct curl_fetch_st *) userp;   /* cast pointer to fetch struct */
 
-    printf("%s %p\n", __func__, userp);
+    //printf("%s %p\n", __func__, userp);
     /* expand buffer */
     p->payload = (char *) realloc(p->payload, p->size + realsize + 1);
 
     /* check buffer */
     if (p->payload == NULL) {
       /* this isn't good */
-      fprintf(stderr, "ERROR: Failed to expand buffer in curl_callback");
+      fprintf(stderr, "ERROR: Failed to expand buffer in %s", __func__);
       /* free buffer */
       free(p->payload);
       /* return */
@@ -78,8 +80,9 @@ size_t curl_callback(void *contents, size_t size, size_t nmemb, void *userp) {
     return realsize;
 }
 
-static int postip(char *url, char *ip)
+static int postip(char *url)
 {
+    char ip[16];
     char hostname[HOST_NAME_MAX];
 
     json_object *json;
@@ -92,13 +95,14 @@ static int postip(char *url, char *ip)
     struct curl_fetch_st curl_fetch;                        /* curl fetch struct */
     struct curl_fetch_st *cf = &curl_fetch;                 /* pointer to fetch struct */
 
-    printf("+%s %p\n", __func__, cf);
+    memset(ip, 0, sizeof(ip));   
+    getip(NETIFNAME, ip, sizeof(ip) - 1);
 
     cf->size = 0;
     cf->payload = (char *) calloc(1, sizeof(cf->payload));
 
     if (cf->payload == NULL) {
-        fprintf(stderr, "ERROR: Failed to allocate payload in curl_fetch_url");
+        syslog(LOG_ERR, "Failed to allocate payload in curl_fetch_url");
         return -1;
     }
 
@@ -171,7 +175,7 @@ static int postip(char *url, char *ip)
 
     if (rcode != CURLE_OK || cf->size < 1) {
             /* log error */
-            fprintf(stderr, "ERROR: Failed to fetch url (%s) - curl said: %s",
+            syslog(LOG_ERR, "Failed to fetch url (%s) '%s'",
                 url, curl_easy_strerror(rcode));
             /* return error */
             return 2;
@@ -187,7 +191,7 @@ static int postip(char *url, char *ip)
         free(cf->payload);
     } else {
         /* error */
-        fprintf(stderr, "ERROR: Failed to populate payload");
+        syslog(LOG_ERR, "Failed to populate payload");
         /* free payload */
         free(cf->payload);
         /* return */
@@ -197,7 +201,7 @@ static int postip(char *url, char *ip)
     /* check error */
     if (json == NULL) {
         /* error */
-        fprintf(stderr, "ERROR: Failed to parse json string");
+        syslog(LOG_ERR, "ERROR: Failed to parse json string");
         /* free json object */
         json_object_put(json);
         /* return */
@@ -224,16 +228,14 @@ static int postip(char *url, char *ip)
 
 int main()
 {
-    char ip[16];
+    int ret = 0;
+    openlog("Client", LOG_CONS | LOG_PID | LOG_NDELAY, LOG_LOCAL1);
+    syslog(LOG_NOTICE, "Client built %s %s started", __DATE__, __TIME__);
     
-    memset(ip, 0, sizeof(ip));
-    ip[0] = '1';
-    
-    getip(NETIFNAME, ip, sizeof(ip) - 1);
-    printf("ip=%s %lu-%lu\n", ip, strlen(ip), sizeof(ip));
 
-    postip(SERVERURL, ip);
+    ret = postip(SERVERURL);
 
     return 0;
 
+    closelog();
 }
