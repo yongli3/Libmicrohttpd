@@ -50,6 +50,7 @@
 
 #ifdef LINUX
 #include <sys/sendfile.h>
+#include <sys/syscall.h>
 #endif
 
 #ifndef _MHD_FD_SETSIZE_IS_DEFAULT
@@ -89,13 +90,13 @@
  * Print extra messages with reasons for closing
  * sockets? (only adds non-error messages).
  */
-#define DEBUG_CLOSE MHD_NO
+#define DEBUG_CLOSE MHD_YES
 
 /**
  * Print extra messages when establishing
  * connections? (only adds non-error messages).
  */
-#define DEBUG_CONNECT MHD_NO
+#define DEBUG_CONNECT MHD_YES
 
 #ifndef LINUX
 #ifndef MSG_NOSIGNAL
@@ -122,7 +123,6 @@
 #if defined(HAVE_EPOLL_CREATE1) && defined(EPOLL_CLOEXEC)
 #define USE_EPOLL_CREATE1 1
 #endif /* HAVE_EPOLL_CREATE1 && EPOLL_CLOEXEC */
-
 
 /**
  * Default implementation of the panic function,
@@ -849,6 +849,10 @@ call_handlers (struct MHD_Connection *con,
   int had_response_before_idle;
   int ret;
 
+#if DEBUG_CONNECT
+   MHD_DLOG(daemon, "+%s state=%d force_close=%d\n", __func__, con->state, force_close);
+#endif
+
 #if HTTPS_SUPPORT
   if (MHD_YES == con->tls_read_ready)
     read_ready = MHD_YES;
@@ -910,6 +914,10 @@ MHD_handle_connection (void *data)
 #endif /* !WINDOWS */
 #ifdef HAVE_POLL
   struct pollfd p[1 + EXTRA_SLOTS];
+#endif
+
+#if DEBUG_CONNECT
+   MHD_DLOG(con->daemon, "+%s state=%d tid=%lu\n", __func__, con->state, syscall(SYS_gettid));
 #endif
 
   while ( (MHD_YES != con->daemon->shutdown) &&
@@ -1094,6 +1102,11 @@ MHD_handle_connection (void *data)
 	}
 #endif
     }
+
+#if DEBUG_CONNECT
+     MHD_DLOG(con->daemon, "%s state=%d\n", __func__, con->state);
+#endif
+  
   if (MHD_CONNECTION_IN_CLEANUP != con->state)
     {
 #if DEBUG_CLOSE
@@ -1121,11 +1134,21 @@ exit:
                                     MHD_CONNECTION_NOTIFY_CLOSED);
   if (MHD_INVALID_SOCKET != con->socket_fd)
     {
+#if DEBUG_CONNECT
+        MHD_DLOG(con->daemon, "%s close socket_fd=%d\n", __func__, con->socket_fd);
+#endif    
       shutdown (con->socket_fd, SHUT_WR);
       if (0 != MHD_socket_close_ (con->socket_fd))
         MHD_PANIC ("close failed\n");
       con->socket_fd = MHD_INVALID_SOCKET;
     }
+#if DEBUG_CONNECT
+     MHD_DLOG(con->daemon, "-%s state=%d\n", __func__, con->state);
+#endif
+
+//if (MHD_CONNECTION_CLOSED == con->state)
+     //MHD_cleanup_connections(con->daemon);
+
   return (MHD_THRD_RTRN_TYPE_) 0;
 }
 
@@ -1309,6 +1332,10 @@ create_thread (MHD_thread_handle_ *thread,
   pthread_attr_t *pattr;
   int ret;
 
+#if DEBUG_CONNECT
+        MHD_DLOG(daemon, "+%s start_routine=%p tid=%lu\n", __func__, start_routine, syscall(SYS_gettid));
+#endif
+
   if (0 != daemon->thread_stack_size)
     {
       if (0 != (ret = pthread_attr_init (&attr)))
@@ -1381,7 +1408,7 @@ create_thread (MHD_thread_handle_ *thread,
  *        set to indicate further details about the error.
  */
 static int
-internal_add_connection (struct MHD_Daemon *daemon,
+internal_add_connection(struct MHD_Daemon *daemon,
 			 MHD_socket client_socket,
 			 const struct sockaddr *addr,
 			 socklen_t addrlen,
@@ -1396,6 +1423,10 @@ internal_add_connection (struct MHD_Daemon *daemon,
   static int on = 1;
 #endif
 
+#if DEBUG_CONNECT
+      MHD_DLOG(daemon, "+%s worker_pool=%p connection=%p tid=%lu client_socket=%d\n", __func__, daemon->worker_pool, connection, syscall(SYS_gettid), client_socket);
+#endif
+
   if (NULL != daemon->worker_pool)
     {
       /* have a pool, try to find a pool with capacity; we use the
@@ -1405,7 +1436,7 @@ internal_add_connection (struct MHD_Daemon *daemon,
         {
           worker = &daemon->worker_pool[(i + client_socket) % daemon->worker_pool_size];
           if (worker->connections < worker->connection_limit)
-            return internal_add_connection (worker,
+            return internal_add_connection(worker,
                                             client_socket,
                                             addr, addrlen,
                                             external_add);
@@ -1442,8 +1473,8 @@ internal_add_connection (struct MHD_Daemon *daemon,
 #ifdef HAVE_MESSAGES
 #if DEBUG_CONNECT
   MHD_DLOG (daemon,
-            "Accepted connection on socket %d\n",
-            client_socket);
+            "Accepted connection on socket %d %d-%d\n",
+            client_socket, daemon->connections, daemon->connection_limit);
 #endif
 #endif
   if ( (daemon->connections == daemon->connection_limit) ||
@@ -1452,7 +1483,8 @@ internal_add_connection (struct MHD_Daemon *daemon,
       /* above connection limit - reject */
 #ifdef HAVE_MESSAGES
       MHD_DLOG (daemon,
-                "Server reached connection limit (closing inbound connection)\n");
+                "***Server reached connection limit (closing inbound connection) %d >= %d\n", 
+                daemon->connections, daemon->connection_limit);
 #endif
       if (0 != MHD_socket_close_ (client_socket))
 	MHD_PANIC ("close failed\n");
@@ -1635,6 +1667,7 @@ internal_add_connection (struct MHD_Daemon *daemon,
   /* attempt to create handler thread */
   if (0 != (daemon->options & MHD_USE_THREAD_PER_CONNECTION))
     {
+    
       res_thread_create = create_thread (&connection->pid,
                                          daemon,
 					 &MHD_handle_connection,
@@ -1649,6 +1682,10 @@ internal_add_connection (struct MHD_Daemon *daemon,
 #endif
 	  goto cleanup;
         }
+#if DEBUG_CONNECT
+    MHD_DLOG(daemon, "%s MHD_handle_connection=%p connection->pid=%lu\n", __func__, MHD_handle_connection, connection->pid);
+#endif      
+      
     }
   else
     if ( (MHD_YES == external_add) &&
@@ -1695,6 +1732,11 @@ internal_add_connection (struct MHD_Daemon *daemon,
     }
 #endif
   daemon->connections++;
+
+#if DEBUG_CONNECT
+          MHD_DLOG(daemon, "-%s worker_pool=%p connection=%p\n", __func__, daemon->worker_pool, connection);
+#endif
+
   return MHD_YES;
  cleanup:
   if (NULL != daemon->notify_connection)
@@ -1725,6 +1767,10 @@ internal_add_connection (struct MHD_Daemon *daemon,
   free (connection);
 #if EINVAL
   errno = eno;
+#endif
+
+#if DEBUG_CONNECT
+        MHD_DLOG(daemon, "-%s worker_pool=%p connection=%p\n", __func__, daemon->worker_pool, connection);
 #endif
   return MHD_NO;
 }
@@ -2020,6 +2066,11 @@ MHD_add_connection (struct MHD_Daemon *daemon,
 		    const struct sockaddr *addr,
 		    socklen_t addrlen)
 {
+
+#if DEBUG_CONNECT
+      MHD_DLOG(daemon, "+%s connections=%d\n", __func__, daemon->connections);
+#endif
+
   /* internal_add_connection() assume that non-blocking is
      already set in MHD_USE_EPOLL_TURBO mode */
   if (0 != (daemon->options & MHD_USE_EPOLL_TURBO))
@@ -2056,6 +2107,10 @@ MHD_accept_connection (struct MHD_Daemon *daemon)
   socklen_t addrlen;
   MHD_socket s;
   MHD_socket fd;
+
+#if DEBUG_CONNECT
+    MHD_DLOG(daemon, "+%s connections=%d\n", __func__, daemon->connections);
+#endif
 
   addrlen = sizeof (addrstorage);
   memset (addr, 0, sizeof (addrstorage));
@@ -2133,7 +2188,6 @@ MHD_accept_connection (struct MHD_Daemon *daemon)
   return MHD_YES;
 }
 
-
 /**
  * Free resources associated with all closed connections.
  * (destroy responses, free buffers, etc.).  All closed
@@ -2142,24 +2196,37 @@ MHD_accept_connection (struct MHD_Daemon *daemon)
  * @param daemon daemon to clean up
  */
 static void
-MHD_cleanup_connections (struct MHD_Daemon *daemon)
+MHD_cleanup_connections(struct MHD_Daemon *daemon)
 {
   struct MHD_Connection *pos;
+  int ret = 0;
+
+#if DEBUG_CONNECT
+      MHD_DLOG(daemon, "+***%s option=0x%x curconn=%d tid=%lu\n", __func__, daemon->options, daemon->connections, syscall(SYS_gettid));
+#endif
 
   if ( (0 != (daemon->options & MHD_USE_THREAD_PER_CONNECTION)) &&
        (MHD_YES != MHD_mutex_lock_ (&daemon->cleanup_connection_mutex)) )
     MHD_PANIC ("Failed to acquire cleanup mutex\n");
   while (NULL != (pos = daemon->cleanup_head))
     {
+#if DEBUG_CONNECT
+      MHD_DLOG(daemon, "%s ***pos=%p pid=%lu\n", __func__, pos, pos->pid);
+#endif        
       DLL_remove (daemon->cleanup_head,
 		  daemon->cleanup_tail,
 		  pos);
       if ( (0 != (daemon->options & MHD_USE_THREAD_PER_CONNECTION)) &&
 	   (MHD_NO == pos->thread_joined) )
 	{
-	  if (0 != MHD_join_thread_ (pos->pid))
+	    ret = MHD_join_thread_ (pos->pid);
+	  if (0 != ret)
 	    {
+	        printf("%s tid=%lu\n", __func__, syscall(SYS_gettid));
+	        
+	        MHD_DLOG(daemon, "pid=%lu ret=%d\n", pos->pid, ret);   
 	      MHD_PANIC ("Failed to join a thread\n");
+          
 	    }
 	}
       MHD_pool_destroy (pos->pool);
@@ -2208,6 +2275,10 @@ MHD_cleanup_connections (struct MHD_Daemon *daemon)
 	  MHD_destroy_response (pos->response);
 	  pos->response = NULL;
 	}
+
+#if DEBUG_CONNECT
+            MHD_DLOG(daemon, "***%s socket_fd=%d\n", __func__, pos->socket_fd);
+#endif      
       if (MHD_INVALID_SOCKET != pos->socket_fd)
 	{
 	  if (0 != MHD_socket_close_ (pos->socket_fd))
@@ -2220,8 +2291,12 @@ MHD_cleanup_connections (struct MHD_Daemon *daemon)
   if ( (0 != (daemon->options & MHD_USE_THREAD_PER_CONNECTION)) &&
        (MHD_YES != MHD_mutex_unlock_ (&daemon->cleanup_connection_mutex)) )
     MHD_PANIC ("Failed to release cleanup mutex\n");
-}
 
+#if DEBUG_CONNECT
+      MHD_DLOG(daemon, "-***%s option=0x%x curconn=%d\n", __func__, daemon->options, daemon->connections);
+#endif
+
+}
 
 /**
  * Obtain timeout value for `select()` for this daemon (only needed if
@@ -2346,6 +2421,10 @@ MHD_run_from_select (struct MHD_Daemon *daemon,
   unsigned int mask = MHD_USE_SUSPEND_RESUME | MHD_USE_EPOLL_INTERNALLY_LINUX_ONLY |
     MHD_USE_SELECT_INTERNALLY | MHD_USE_POLL_INTERNALLY | MHD_USE_THREAD_PER_CONNECTION;
 
+#if DEBUG_CONNECT
+    MHD_DLOG(daemon, "+%s option=0x%x %d tid=%lu\n", __func__, daemon->options, daemon->connections, syscall(SYS_gettid));
+#endif
+
   /* drain signaling pipe to avoid spinning select */
   /* Do it before any other processing so new signals
      will trigger select again and will be processed */
@@ -2370,6 +2449,9 @@ MHD_run_from_select (struct MHD_Daemon *daemon,
     }
 #endif
 
+// FIXME 
+MHD_cleanup_connections (daemon);
+
   /* select connection thread handling type */
   if ( (MHD_INVALID_SOCKET != (ds = daemon->socket_fd)) &&
        (FD_ISSET (ds, read_fd_set)) )
@@ -2392,6 +2474,10 @@ MHD_run_from_select (struct MHD_Daemon *daemon,
         }
     }
   MHD_cleanup_connections (daemon);
+#if DEBUG_CONNECT
+      MHD_DLOG(daemon, "-%s option=0x%x %d\n", __func__, daemon->options, daemon->connections);
+#endif
+  
   return MHD_YES;
 }
 
@@ -2418,10 +2504,20 @@ MHD_select (struct MHD_Daemon *daemon,
   MHD_UNSIGNED_LONG_LONG ltimeout;
   int err_state;
 
+#if DEBUG_CONNECT
+    MHD_DLOG(daemon, "+*%s option=0x%x may_block=%d socket_fd=%d tid=%lu\n", 
+    __func__, daemon->options, may_block, daemon->socket_fd, syscall(SYS_gettid));
+#endif
+
   timeout.tv_sec = 0;
   timeout.tv_usec = 0;
-  if (MHD_YES == daemon->shutdown)
+  if (MHD_YES == daemon->shutdown) {
+#if DEBUG_CONNECT
+    MHD_DLOG(daemon, "%s option= 0x%x\n", __func__, daemon->options);
+#endif
+    
     return MHD_NO;
+  }
   FD_ZERO (&rs);
   FD_ZERO (&ws);
   FD_ZERO (&es);
@@ -2518,11 +2614,32 @@ MHD_select (struct MHD_Daemon *daemon,
         timeout.tv_sec = (_MHD_TIMEVAL_TV_SEC_TYPE)(ltimeout / 1000);
       tv = &timeout;
     }
+
+#if DEBUG_CONNECT
+    MHD_DLOG(daemon, "*%s-%d tv=%p tid=%lu\n", __func__, __LINE__, tv, syscall(SYS_gettid));
+#endif
+  
   num_ready = MHD_SYS_select_ (maxsock + 1, &rs, &ws, &es, tv);
-  if (MHD_YES == daemon->shutdown)
+  if (MHD_YES == daemon->shutdown) {
+#if DEBUG_CONNECT
+          MHD_DLOG(daemon, "%s option=0x%x\n", __func__, daemon->options);
+#endif
+
     return MHD_NO;
+  }
+
+#if DEBUG_CONNECT
+    MHD_DLOG(daemon, "*%s-%d num_ready=%d\n", __func__, __LINE__, num_ready);
+#endif
+
   if (num_ready < 0)
     {
+
+#if DEBUG_CONNECT
+    MHD_DLOG(daemon, "%s num_ready=%d errno=%d\n", __func__, num_ready, errno);
+#endif
+
+    
       if (EINTR == MHD_socket_errno_)
         return (MHD_NO == err_state) ? MHD_YES : MHD_NO;
 #ifdef HAVE_MESSAGES
@@ -2532,6 +2649,11 @@ MHD_select (struct MHD_Daemon *daemon,
 #endif
       return MHD_NO;
     }
+
+#if DEBUG_CONNECT
+      MHD_DLOG(daemon, "*%s option=0x%x\n", __func__, daemon->options);
+#endif
+  
   if (MHD_YES == MHD_run_from_select (daemon, &rs, &ws, &es))
     return (MHD_NO == err_state) ? MHD_YES : MHD_NO;
   return MHD_NO;
@@ -3022,6 +3144,11 @@ MHD_epoll (struct MHD_Daemon *daemon,
 int
 MHD_run (struct MHD_Daemon *daemon)
 {
+
+#if DEBUG_CONNECT
+    MHD_DLOG(daemon, "+%s option=0x%x %d\n", __func__, daemon->options, daemon->connections);
+#endif
+
   if ( (MHD_YES == daemon->shutdown) ||
        (0 != (daemon->options & MHD_USE_THREAD_PER_CONNECTION)) ||
        (0 != (daemon->options & MHD_USE_SELECT_INTERNALLY)) )
@@ -3043,6 +3170,9 @@ MHD_run (struct MHD_Daemon *daemon)
     MHD_select (daemon, MHD_NO);
     /* MHD_select does MHD_cleanup_connections already */
   }
+#if DEBUG_CONNECT
+      MHD_DLOG(daemon, "-%s option=0x%x %d\n", __func__, daemon->options, daemon->connections);
+#endif  
   return MHD_YES;
 }
 
@@ -3055,10 +3185,12 @@ MHD_run (struct MHD_Daemon *daemon)
  * @return always 0 (on shutdown)
  */
 static MHD_THRD_RTRN_TYPE_ MHD_THRD_CALL_SPEC_
-MHD_select_thread (void *cls)
+MHD_select_thread(void *cls)
 {
   struct MHD_Daemon *daemon = cls;
-
+#if DEBUG_CONNECT
+    MHD_DLOG(daemon, "+%s options=0x%x tid=%lu\n", __func__, daemon->options, syscall(SYS_gettid), syscall(SYS_gettid));
+#endif
   while (MHD_YES != daemon->shutdown)
     {
       if (0 != (daemon->options & MHD_USE_POLL))
@@ -3069,8 +3201,15 @@ MHD_select_thread (void *cls)
 #endif
       else
 	MHD_select (daemon, MHD_YES);
-      MHD_cleanup_connections (daemon);
+#if DEBUG_CONNECT
+    MHD_DLOG(daemon, "%s-%d after MHD_select\n", __func__, __LINE__);
+#endif
+      
+     MHD_cleanup_connections (daemon);
     }
+#if DEBUG_CONNECT
+      MHD_DLOG(daemon, "-%s options=0x%x\n", __func__, daemon->options);
+#endif
   return (MHD_THRD_RTRN_TYPE_)0;
 }
 
@@ -4303,6 +4442,11 @@ MHD_start_daemon_va (unsigned int flags,
       goto free_and_fail;
     }
 #endif
+
+#if DEBUG_CONNECT
+    MHD_DLOG(daemon, "%s MHD_select_thread=%p tid=%lu\n", __func__, MHD_select_thread, syscall(SYS_gettid));
+#endif
+
   if ( ( (0 != (flags & MHD_USE_THREAD_PER_CONNECTION)) ||
 	 ( (0 != (flags & MHD_USE_SELECT_INTERNALLY)) &&
 	   (0 == daemon->worker_pool_size)) ) &&
@@ -4415,6 +4559,10 @@ MHD_start_daemon_va (unsigned int flags,
               goto thread_failed;
             }
 
+#if DEBUG_CONNECT
+    MHD_DLOG(daemon, "%s MHD_select_thread= %p\n", __func__, MHD_select_thread);
+#endif
+
           /* Spawn the worker thread */
           if (0 != (res_thread_create =
 		    create_thread (&d->pid, daemon, &MHD_select_thread, d)))
@@ -4436,6 +4584,10 @@ MHD_start_daemon_va (unsigned int flags,
      so we additionally NULL it here to not deref a dangling pointer. */
   daemon->https_key_password = NULL;
 #endif /* HTTPS_SUPPORT */
+
+#if DEBUG_CONNECT
+      MHD_DLOG(daemon, "-%s erturn %p\n", __func__, daemon);
+#endif
 
   return daemon;
 
@@ -4501,6 +4653,10 @@ close_connection (struct MHD_Connection *pos)
 {
   struct MHD_Daemon *daemon = pos->daemon;
 
+#if DEBUG_CONNECT
+        MHD_DLOG(daemon, "+%s option=0x%x %d\n", __func__, daemon->options, daemon->connections);
+#endif
+
   MHD_connection_close_ (pos,
                          MHD_REQUEST_TERMINATED_DAEMON_SHUTDOWN);
   if (0 != (daemon->options & MHD_USE_THREAD_PER_CONNECTION))
@@ -4534,6 +4690,10 @@ static void
 close_all_connections (struct MHD_Daemon *daemon)
 {
   struct MHD_Connection *pos;
+
+#if DEBUG_CONNECT
+      MHD_DLOG(daemon, "+%s option=0x%x %d\n", __func__, daemon->options, daemon->connections);
+#endif
 
   /* first, make sure all threads are aware of shutdown; need to
      traverse DLLs in peace... */
@@ -4786,6 +4946,11 @@ MHD_get_daemon_info (struct MHD_Daemon *daemon,
 		     enum MHD_DaemonInfoType info_type,
 		     ...)
 {
+
+#if DEBUG_CONNECT
+      MHD_DLOG(daemon, "+%s option=0x%x %d\n", __func__, daemon->options, daemon->connections);
+#endif
+
   switch (info_type)
     {
     case MHD_DAEMON_INFO_KEY_SIZE:

@@ -472,7 +472,7 @@ enum MHD_CONNECTION_STATE
 /**
  * Should all state transitions be printed to stderr?
  */
-#define DEBUG_STATES MHD_NO
+#define DEBUG_STATES MHD_YES
 
 
 #ifdef HAVE_MESSAGES

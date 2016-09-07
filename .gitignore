@@ -1,0 +1,6 @@
+*.so
+*.o
+*.a
+*.lo
+Makefile.in
+.deps/

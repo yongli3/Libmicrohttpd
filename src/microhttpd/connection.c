@@ -32,6 +32,8 @@
 #include "mhd_mono_clock.h"
 #include "mhd_str.h"
 
+#include <sys/syscall.h>
+
 #if HAVE_NETINET_TCP_H
 /* for TCP_CORK */
 #include <netinet/tcp.h>
@@ -105,12 +107,12 @@
  * Add extra debug messages with reasons for closing connections
  * (non-error reasons).
  */
-#define DEBUG_CLOSE MHD_NO
+#define DEBUG_CLOSE MHD_YES
 
 /**
  * Should all data send be printed to stderr?
  */
-#define DEBUG_SEND_DATA MHD_NO
+#define DEBUG_SEND_DATA MHD_YES
 
 
 /**
@@ -481,6 +483,11 @@ MHD_connection_close_ (struct MHD_Connection *connection,
   struct MHD_Daemon *daemon;
 
   daemon = connection->daemon;
+
+#if DEBUG_CLOSE
+      MHD_DLOG(daemon, "+%s option=0x%x curconn=%d conn=%p\n", __func__, daemon->options, daemon->connections, connection);
+#endif
+
   if (0 == (connection->daemon->options & MHD_USE_EPOLL_TURBO))
     shutdown (connection->socket_fd, SHUT_WR);
   connection->state = MHD_CONNECTION_CLOSED;
@@ -720,6 +727,11 @@ static int
 keepalive_possible (struct MHD_Connection *connection)
 {
   const char *end;
+
+#if DEBUG_CLOSE
+      MHD_DLOG(connection->daemon, "+%s option=0x%x curconn=%d conn=%p ver=%s\n", 
+      __func__, connection->daemon->options, connection->daemon->connections, connection, connection->version);
+#endif
 
   if (NULL == connection->version)
     return MHD_NO;
@@ -2396,6 +2408,11 @@ cleanup_connection (struct MHD_Connection *connection)
 {
   struct MHD_Daemon *daemon = connection->daemon;
 
+#if DEBUG_CLOSE
+        MHD_DLOG(daemon, "+%s option=0x%x curconn=%d conn=%p tid=%lu\n", 
+        __func__, daemon->options, daemon->connections, connection, syscall(SYS_gettid));
+#endif
+
   if (NULL != connection->response)
     {
       MHD_destroy_response (connection->response);
@@ -2434,6 +2451,11 @@ cleanup_connection (struct MHD_Connection *connection)
   if ( (0 != (daemon->options & MHD_USE_THREAD_PER_CONNECTION)) &&
        (MHD_YES != MHD_mutex_unlock_(&daemon->cleanup_connection_mutex)) )
     MHD_PANIC ("Failed to release cleanup mutex\n");
+
+#if DEBUG_CLOSE
+    MHD_DLOG(daemon, "-%s option=0x%x curconn=%d conn=%p\n", __func__, daemon->options, daemon->connections, connection);
+#endif
+
 }
 
 
@@ -2455,6 +2477,10 @@ MHD_connection_handle_idle (struct MHD_Connection *connection)
   size_t line_len;
   int client_close;
 
+#if DEBUG_CLOSE
+    MHD_DLOG(daemon, "+%s option=0x%x connections=%d conn=%p state=%d timeout=%d tid=%lu\n", 
+    __func__, daemon->options, daemon->connections, connection, connection->state, connection->connection_timeout, syscall(SYS_gettid));
+#endif
   connection->in_idle = MHD_YES;
   while (1)
     {
@@ -3101,6 +3127,11 @@ MHD_queue_response (struct MHD_Connection *connection,
                     unsigned int status_code,
                     struct MHD_Response *response)
 {
+
+#if DEBUG_CLOSE
+    MHD_DLOG(connection->daemon, "+%s option=0x%x curconn=%d conn=%p\n", __func__, connection->daemon->options, connection->daemon->connections, connection);
+#endif
+
   if ( (NULL == connection) ||
        (NULL == response) ||
        (NULL != connection->response) ||
