@@ -38,6 +38,9 @@ curl -vvv -H "Connection: Close" -H "Content-Type: application/json" -H "accept:
 #include <semaphore.h>
 #include <signal.h>
 #include <errno.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <time.h>
 #include <json-c/json.h>
 #include <sys/time.h>
@@ -55,13 +58,40 @@ curl -vvv -H "Connection: Close" -H "Content-Type: application/json" -H "accept:
 #include <netdb.h>
 #include <ifaddrs.h>
 #include <stdio.h>
-#include <unistd.h>
+#include <math.h>
 
 #include <curl/curl.h>
+#include <sqlite3.h>
+
+#define MAX_POUR_TIME_SECONDS   (150)
+#define POUR_GPIO       (10)
+#define SYSFS_GPIO_DIR "/sys/class/gpio"
+#define MAX_BUF (64)
 
 #define MAX_RECV (1024)
 #define PAGE "<html><head><title>X1000</title></head><body>X1000</body></html>"
 #define debug(...) _debug(__BASE_FILE__, __LINE__, __VA_ARGS__)
+
+#define HARDWARE_STORAGE_ERROR  ("300")
+#define HARDWARE_STORAGE_NORMAL  ("301")
+#define HARDWARE_NETWORK_ERROR  ("400")
+#define HARDWARE_NETWORK_NORMAL  ("401")
+#define HARDWARE_DEVICE_ERROR  ("500")
+#define HARDWARE_DEVICE_NORMAL  ("501")
+
+#define RESULT_NORMAL           ("0")
+#define RESULT_ABNORMAL         ("1")
+
+#define USE_STATUS_NORMAL       ("1")
+#define USE_STATUS_OFF          ("2")
+#define USE_STATUS_PROCESSING   ("3")
+#define USE_STATUS_ABNORMAL     ("4")
+
+#define CHARDING_TYPE_COUNT     ("1")
+#define CHARDING_TYPE_PERIOD    ("2")
+
+#define DEFAULT_POUR_TIMEOUT    ("30")
+#define DEFAULT_REPORT_TIMEOUT  ("60")
 
 //bool stophttp = false;
 
@@ -89,11 +119,28 @@ typedef struct {
 
 static s_config config;
 static unsigned char signkey[33];
-static unsigned char *org_sign = "d53fd9852538440c926765dd69927a2c";
+static unsigned char *master_sign = "d53fd9852538440c926765dd69927a2c";
+
+static unsigned char g_server_url[64];
+static unsigned char g_gap_no[32];
+
+static unsigned char g_device_status[32];
+static unsigned char g_result[2];
+static unsigned char g_errorcode[32];
+static unsigned char g_use_status[2];
 static unsigned char g_charging_type[2];
+
 static unsigned char g_charging_time_s[13];
 static unsigned char g_charging_time_e[13];
-unsigned char g_water_processing = 0;
+static unsigned char g_water_processing = 0;
+static unsigned char  g_pour_timeout[3];
+static unsigned char g_dbname[32];
+
+static pthread_mutex_t processing_mutex;
+
+//pthread_mutex_init pthread_mutex_lock(processing_mutex)
+
+//pthread_cond_wait
 
 static void _debug(const char filename[], int line, int level, const char *format, ...)
 {
@@ -233,6 +280,66 @@ ahc_echo size=5 data={a:b}
 +ahc_echo method=POST url=/ version=HTTP/1.1
 Post data: {a:b}
 #endif
+
+static int update_callback(void *data, int argc, char **argv, char **azColName){
+   int i;
+   fprintf(stdout, "+%s %s: ", __func__, (const char*)data);
+   for(i=0; i<argc; i++){
+      printf("%s = %s\n", azColName[i], argv[i] ? argv[i] : "NULL");
+   }
+   printf("\n");
+   return 0;
+}
+
+static int select_callback(void *data, int argc, char **argv, char **azColName)
+{
+    int i;
+   
+    printf("+%s\n", __func__);
+ 
+   for(i=0; i<argc; i++){
+      printf("%s = %s\n", azColName[i], argv[i] ? argv[i] : "NULL");
+      strcpy(data, argv[i]);
+      break;
+   }
+   return 0;
+}
+
+static int insert(char *key, char *value)
+{
+    sqlite3 *db = NULL;
+    char *zErrMsg = 0;
+    int  rc, ret;
+    char sql[256];
+    char *data = "";
+
+    ret = -1;
+    rc = sqlite3_open(g_dbname, &db);
+    if( rc ){
+          fprintf(stderr, "Can't open database: %s\n", sqlite3_errmsg(db));
+          return ret;
+    }else{
+          fprintf(stdout, "Opened database successfully\n");
+    }
+
+    snprintf(sql, sizeof(sql), "insert or replace into config (id, key, value) values ((select id from config where key=\"%s\"), \"%s\", \"%s\")", key, key, value);
+
+    rc = sqlite3_exec(db, sql, update_callback, (void*)data, &zErrMsg);
+    if( rc != SQLITE_OK ){
+        fprintf(stderr, "SQL error: %s\n", zErrMsg);
+        sqlite3_free(zErrMsg);          
+     }else{
+        ret = 0;
+        fprintf(stdout, "Operation done successfully\n");
+     }
+
+    if (db)
+        sqlite3_close(db);
+
+    return ret;
+
+}
+
 
 static pid_t safe_fork(void)
 {
@@ -434,21 +541,519 @@ static int generate_json_error(json_object *jobj, int errorcode)
     return 0;
 }
 
-// process restful commands, and return json string
-static int generate_json(json_object *jobj, const char *recv_command, const char *recv_sign, json_object *recv_jobj) 
+static int gpio_export(unsigned int gpio)
+{
+	int fd, len;
+	char buf[MAX_BUF];
+ 
+	fd = open(SYSFS_GPIO_DIR "/export", O_WRONLY);
+	if (fd < 0) {
+		perror("gpio/export");
+		return fd;
+	}
+ 
+	len = snprintf(buf, sizeof(buf), "%d", gpio);
+	write(fd, buf, len);
+	close(fd);
+ 
+	return 0;
+}
+
+static int gpio_unexport(unsigned int gpio)
+{
+	int fd, len;
+	char buf[MAX_BUF];
+ 
+	fd = open(SYSFS_GPIO_DIR "/unexport", O_WRONLY);
+	if (fd < 0) {
+		perror("gpio/export");
+		return fd;
+	}
+ 
+	len = snprintf(buf, sizeof(buf), "%d", gpio);
+	write(fd, buf, len);
+	close(fd);
+	return 0;
+}
+
+static int gpio_set_dir(unsigned int gpio, unsigned int out_flag)
+{
+	int fd, len;
+	char buf[MAX_BUF];
+ 
+	len = snprintf(buf, sizeof(buf), SYSFS_GPIO_DIR  "/gpio%d/direction", gpio);
+ 
+	fd = open(buf, O_WRONLY);
+	if (fd < 0) {
+		perror("gpio/direction");
+		return fd;
+	}
+ 
+	if (out_flag)
+		write(fd, "out", 4);
+	else
+		write(fd, "in", 3);
+ 
+	close(fd);
+	return 0;
+}
+
+static int gpio_set_value(unsigned int gpio, unsigned int value)
+{
+	int fd, len;
+	char buf[MAX_BUF];
+ 
+	len = snprintf(buf, sizeof(buf), SYSFS_GPIO_DIR "/gpio%d/value", gpio);
+ 
+	fd = open(buf, O_WRONLY);
+	if (fd < 0) {
+		perror("gpio/set-value");
+		return fd;
+	}
+ 
+	if (value)
+		write(fd, "1", 2);
+	else
+		write(fd, "0", 2);
+ 
+	close(fd);
+	return 0;
+}
+
+static int gpio_get_value(unsigned int gpio, unsigned int *value)
+{
+	int fd, len;
+	char buf[MAX_BUF];
+	char ch;
+
+	len = snprintf(buf, sizeof(buf), SYSFS_GPIO_DIR "/gpio%d/value", gpio);
+ 
+	fd = open(buf, O_RDONLY);
+	if (fd < 0) {
+		perror("gpio/get-value");
+		return fd;
+	}
+ 
+	read(fd, &ch, 1);
+
+	if (ch != '0') {
+		*value = 1;
+	} else {
+		*value = 0;
+	}
+ 
+	close(fd);
+	return 0;
+}
+
+static int gpio_set_edge(unsigned int gpio, char *edge)
+{
+	int fd, len;
+	char buf[MAX_BUF];
+
+	len = snprintf(buf, sizeof(buf), SYSFS_GPIO_DIR "/gpio%d/edge", gpio);
+ 
+	fd = open(buf, O_WRONLY);
+	if (fd < 0) {
+		perror("gpio/set-edge");
+		return fd;
+	}
+ 
+	write(fd, edge, strlen(edge) + 1); 
+	close(fd);
+	return 0;
+}
+
+// polling gpio
+static int gpio_poll(int gpio, int time_seconds)
+{
+    struct timespec spec;
+    int left_ms = 0;
+    int wait_ms = 0;
+    unsigned int water_seconds;
+    unsigned int total_ms;
+    time_t last_pressed_second = 0;
+    unsigned long last_pressed_millisecond = 0;
+    time_t current_second = 0;
+    unsigned long current_millisecond = 0;
+    time_t last_second = 0;
+    unsigned long last_millisecond = 0;    
+    int fd, ret;
+    char val[2], buf[MAX_BUF];
+    unsigned char key_value, key_pressed, key_is_pressing;
+    sigset_t emptyset;
+    struct pollfd fds = {0};
+
+    gpio_export(gpio);
+    gpio_set_dir(gpio, 0);
+    gpio_set_edge(gpio, "both");
+    
+    snprintf(buf, sizeof(buf), SYSFS_GPIO_DIR "/gpio%d/value", gpio);
+    fd = open(buf , O_RDONLY);
+    printf("path = %s fd = %d\n", buf, fd);
+
+    fds.fd = fd;
+    fds.events = POLLPRI;
+    sigemptyset(&emptyset);
+    total_ms = 0;
+    key_is_pressing = 0;
+    water_seconds = time_seconds;
+    left_ms = water_seconds * 1000;
+    last_pressed_second = 0;    
+
+    while ((total_ms < ((10+water_seconds)*1000)) && (left_ms > 0)) {
+        //ret = fallback_ppoll(&fds, 1, 3000, &emptyset);
+        clock_gettime(CLOCK_REALTIME, &spec);
+        last_second = spec.tv_sec;
+        last_millisecond = round(spec.tv_nsec / 1.0e6);
+        wait_ms = left_ms;
+        if ((wait_ms + total_ms) > ((10+water_seconds)*1000)) { 
+            wait_ms = ((10+water_seconds)*1000) - total_ms;
+        }
+        printf("**poll left=%d passed=%d wait=%d\n", left_ms, total_ms, wait_ms);
+        ret = poll(&fds, 1, wait_ms);
+        // get data or timeout or error
+        if (0 == ret) { // timeout, no change on GPIO            
+            total_ms += wait_ms;
+            printf("timeout %d-%d-%d ", wait_ms, left_ms, total_ms);
+            lseek(fd, 0, SEEK_SET);
+            if (read(fd, val, 2 * sizeof(char)) != 2)
+                printf("could not read value\n");
+            else { // check gpio value
+                key_value = strtol(val, NULL, 10); // 0 = pressed
+                key_pressed = key_value ? 0:1;
+                printf("key %s\n", key_value ? "release":"pressed");
+            }
+
+            if (key_pressed) { // keep pressed & timeout
+                printf("MUST-STOP left=%d pressed_ms=%d\n", left_ms, wait_ms);
+                left_ms -= wait_ms;
+                break;
+            }
+            
+        } else if (ret < 0) {
+            printf("error %s\n", strerror(errno));
+            total_ms += 1000;
+        } else {// get data
+            clock_gettime(CLOCK_REALTIME, &spec);
+            current_second = spec.tv_sec;
+            current_millisecond = round(spec.tv_nsec / 1.0e6);
+            total_ms = total_ms + (current_second - last_second) * 1000
+                + (current_millisecond - last_millisecond);
+            
+            printf("%d ret=%d response events: 0x%X ", key_is_pressing, ret, fds.revents);        
+            lseek(fd, 0, SEEK_SET);
+            if (read(fd, val, 2 * sizeof(char)) != 2)
+                printf("could not read value\n");
+            else { // check gpio value
+                key_value = strtol(val, NULL, 10);
+                key_pressed = key_value ? 0:1;
+                printf("key %s\n", key_value ? "release":"pressed");
+                if (key_pressed) {
+                    if (0 == last_pressed_second) { // first time pressed
+                        last_pressed_second = current_second;
+                        last_pressed_millisecond = current_millisecond;
+                        key_is_pressing = 1;
+                    } else { // pressed not the first time
+                        if (key_is_pressing) { // pressed->pressed
+                            printf("impossible pressed!\n"); // 
+                        } else { // release->pressed
+                            last_pressed_second = current_second;
+                            last_pressed_millisecond = current_millisecond;
+                            key_is_pressing = 1;
+                        }
+                    }
+                } else { // key release
+                    if (0 == last_pressed_second) { //no pressed
+                        if (key_is_pressing) {// pressed->release
+                            printf("impossible p->r\n");
+                        } else { // release->release
+                            printf("first released!\n");
+                        }
+
+                    } else {// pressed before
+                        if (key_is_pressing) {//press->release
+                            printf("left_ms=%d pressed_ms=%lu\n", left_ms, 1000 * (current_second - last_pressed_second) 
+                            + (current_millisecond - last_pressed_millisecond));
+                            left_ms = left_ms - 
+                           1000 * (current_second - last_pressed_second) 
+                            - (current_millisecond - last_pressed_millisecond);
+                        } else {//relase->release
+                            printf("impossible r->r\n");
+                        }
+                        //difftime                                                              
+                    }
+                    key_is_pressing = 0;
+                }
+            }
+        }
+    }
+
+    printf("total=%d left=%d\n", total_ms, left_ms);
+    
+    close(fd);
+
+    gpio_unexport(gpio);
+    return left_ms;
+}
+
+static size_t curl_callback(void *contents, size_t size, size_t nmemb, void *userp) 
+{
+    size_t realsize = size * nmemb;                             /* calculate buffer size */
+    struct curl_fetch_st *p = (struct curl_fetch_st *) userp;   /* cast pointer to fetch struct */
+
+    //printf("%s %p\n", __func__, userp);
+    /* expand buffer */
+    p->payload = (char *) realloc(p->payload, p->size + realsize + 1);
+
+    /* check buffer */
+    if (p->payload == NULL) {
+      /* this isn't good */
+      debug(LOG_ERR, "ERROR: Failed to expand buffer in %s", __func__);
+      /* free buffer */
+      free(p->payload);
+      /* return */
+      return -1;
+    }
+
+    /* copy contents to buffer */
+    memcpy(&(p->payload[p->size]), contents, realsize);
+
+    /* set new buffer size */
+    p->size += realsize;
+
+    /* ensure null termination */
+    p->payload[p->size] = 0;
+
+    /* return size */
+    return realsize;
+}
+
+// send result to server after processing POUT command
+static int report_water(char *url, int water_time)
+{
+    char str_time[32];
+    char hostname[HOST_NAME_MAX];
+    const char *recv_item = NULL;
+    json_object *jobj;
+    json_object *retobj;
+    enum json_tokener_error jerr = json_tokener_success;
+
+    CURL *ch;                                               /* curl handle */
+    CURLcode rcode;
+    struct curl_slist *headers = NULL;
+    struct curl_fetch_st curl_fetch;                        /* curl fetch struct */
+    struct curl_fetch_st *cf = &curl_fetch;                 /* pointer to fetch struct */
+
+    snprintf(str_time, sizeof(str_time), "%f", (water_time/1000.0));
+
+    cf->size = 0;
+    cf->payload = (char *) calloc(1, sizeof(cf->payload));
+
+    if (cf->payload == NULL) {
+        debug(LOG_ERR, "Failed to allocate payload in curl_fetch_url");
+        return -1;
+    }
+
+    /* init curl handle */
+    if ((ch = curl_easy_init()) == NULL) {
+        /* log error */
+        debug(LOG_ERR, "ERROR: Failed to create curl handle in fetch_session");
+        /* return error */
+        return 1;
+    }
+
+    /* set content type */
+    headers = curl_slist_append(headers, "Accept: application/json");
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+
+    jobj = json_object_new_object();
+
+    if (gethostname(hostname, sizeof(hostname)) != 0) {
+        debug(LOG_ERR, "gethostname failed with %d\n", errno);
+    }
+
+    gethostname(hostname, sizeof(hostname));
+    json_object_object_add(jobj,"command", json_object_new_string("report_water"));
+    json_object_object_add(jobj,"sign", json_object_new_string(signkey));
+    json_object_object_add(jobj,"hardware_no", json_object_new_string(hostname));
+    //TODO get device use_status and hardware status
+    json_object_object_add(jobj,"gap_no", json_object_new_string(g_gap_no));
+    json_object_object_add(jobj,"water_time", json_object_new_string(str_time));
+        
+    debug(LOG_DEBUG, "json='%s', len=%lu\n", json_object_to_json_string(jobj), strlen(json_object_to_json_string(jobj)));
+    debug(LOG_DEBUG, "url=%s\n", url);
+
+    /* set curl options */
+    curl_easy_setopt(ch, CURLOPT_CUSTOMREQUEST, "POST");
+    curl_easy_setopt(ch, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(ch, CURLOPT_POSTFIELDS, json_object_to_json_string(jobj));
+    /* set timeout */
+    curl_easy_setopt(ch, CURLOPT_TIMEOUT, (long)155);
+    
+    /* set url to fetch */
+    curl_easy_setopt(ch, CURLOPT_URL, url);
+
+    /* set calback function */
+    curl_easy_setopt(ch, CURLOPT_WRITEFUNCTION, curl_callback);
+
+    /* pass fetch struct pointer */
+    curl_easy_setopt(ch, CURLOPT_WRITEDATA, (void *) cf);
+
+    /* set default user agent */
+    curl_easy_setopt(ch, CURLOPT_USERAGENT, "libcurl-agent/1.0");
+
+    /* enable location redirects */
+    curl_easy_setopt(ch, CURLOPT_FOLLOWLOCATION, 1);
+
+    /* set maximum allowed redirects */
+    curl_easy_setopt(ch, CURLOPT_MAXREDIRS, 1);
+    curl_easy_setopt(ch, CURLOPT_VERBOSE, 1L);
+
+    /* fetch the url */
+    rcode = curl_easy_perform(ch);
+
+    //rcode = curl_fetch_url(ch, url, cf);
+    curl_easy_cleanup(ch);
+    curl_slist_free_all(headers);
+    if (jobj != NULL) {
+        debug(LOG_DEBUG, "Free JSON");
+        json_object_put(jobj);
+    }
+
+    if (rcode != CURLE_OK || cf->size < 1) {
+            /* log error */
+            debug(LOG_ERR, "%s Failed to fetch url (%s) '%s'", __func__, 
+                url, curl_easy_strerror(rcode));
+            /* return error */
+            return 2;
+     }
+
+    /* check payload */
+    if (cf->payload != NULL) {
+        /* print result */
+        debug(LOG_DEBUG, "CURL Returned: %s len=%lu\n", cf->payload, strlen(cf->payload));
+        /* parse return */
+        jobj = json_tokener_parse(cf->payload); //json_tokener_parse_verbose(cf->payload, &jerr);
+        /* free payload */
+        free(cf->payload);
+    } else {
+        /* error */
+        debug(LOG_ERR, "Failed to populate payload");
+        /* free payload */
+        free(cf->payload);
+        /* return */
+        return 3;
+    }
+
+    /* check error */
+    if (jobj == NULL) {
+        /* error */
+        debug(LOG_ERR, "ERROR: Failed to parse json string");
+        /* free json object */
+        json_object_put(jobj);
+        /* return */
+        return 4;
+    }
+
+    /* debugging */
+    debug(LOG_DEBUG, "%s Parsed JSON: %s\n", __func__, json_object_to_json_string(jobj));
+
+    // parse config data from the JSON string
+    json_object_object_get_ex(jobj, "newsign", &retobj);
+    recv_item = json_object_get_string(retobj);
+    if (NULL == recv_item) {
+        debug(LOG_ERR, "%s no new signkey\n", __func__);
+        return 5;
+    }
+    memcpy(signkey, recv_item, sizeof(signkey) - 1);
+    debug(LOG_DEBUG, "newsign=%s signkey=%s\n", recv_item, signkey);
+
+    json_object_object_get_ex(jobj, "charging_type", &retobj);
+    recv_item = json_object_get_string(retobj);
+    if (NULL == recv_item) {
+        debug(LOG_ERR, "%s no charging_type\n", __func__);
+        return 5;
+    }
+    memcpy(g_charging_type, recv_item, sizeof(g_charging_type) - 1);
+    debug(LOG_DEBUG, "charging_type=%s\n", recv_item);
+
+    json_object_object_get_ex(jobj, "charging_time_s", &retobj);
+    recv_item = json_object_get_string(retobj);
+    if (NULL == recv_item) {
+        debug(LOG_ERR, "%s no charging_time_s\n", __func__);
+        return 5;
+    }
+    memcpy(g_charging_time_s, recv_item, sizeof(g_charging_time_s) - 1);
+    debug(LOG_DEBUG, "charging_time_s=%s\n", recv_item);
+
+    json_object_object_get_ex(jobj, "charging_time_e", &retobj);
+     recv_item = json_object_get_string(retobj);
+     if (NULL == recv_item) {
+         debug(LOG_ERR, "%s no charging_time_e\n", __func__);
+         return 5;
+     }
+     memcpy(g_charging_time_e, recv_item, sizeof(g_charging_time_e) - 1);
+     debug(LOG_DEBUG, "charging_time_e=%s\n", recv_item);
+
+
+    if (jobj != NULL) {
+        debug(LOG_DEBUG, "%s Free JSON\n", __func__);
+        json_object_put(jobj);
+    }
+
+    return 0;
+}
+
+// thread control hardware for POUR
+static void *pourthreadfunc(void *arg)
+{
+    int *water_time = (int *) arg;
+    int fd, ret;
+    unsigned int remaining_time;
+    unsigned char c;
+    struct pollfd fdset;
+
+    debug(LOG_DEBUG, "%s water_time=%d", __func__, *water_time);
+
+    // TODO power on
+
+    remaining_time = 1000 * (*water_time + atoi(DEFAULT_REPORT_TIMEOUT));
+
+    ret = gpio_poll(POUR_GPIO, *water_time);
+
+    report_water(g_server_url, *water_time - ret);
+
+    pthread_mutex_lock(&processing_mutex);
+    g_water_processing = 0;
+    pthread_mutex_unlock(&processing_mutex);
+    snprintf(g_use_status, sizeof(g_use_status), "%s", USE_STATUS_NORMAL);
+    
+    
+    return NULL;
+}
+
+// business logic
+// process restful commands, and return json string 
+// return -1 if input options incorrect
+static int process_logic(json_object *jobj, const char *recv_command, const char *recv_sign, json_object *recv_jobj) 
 {
     json_object *retobj;
     char *netif = "enp2s0";
     char hostname[33];
     struct tm *timeinfo;
     struct timeval curtime;
-    int milli;
-    //char buffer[32];
+    int milli, ret;
+    int water_time;
+    char buffer[32];
     //char iso8601[32];
+    unsigned char start_pour;
     char ip[16];
     char *pch;;
     const char *json_string;
     const char *recv_item = NULL;
+    pthread_t  pourthread;
+    time_t t;
 
     debug(LOG_DEBUG, "+%s CMD=%s SIGN=%s", __func__, recv_command, recv_sign);
       
@@ -467,72 +1072,130 @@ static int generate_json(json_object *jobj, const char *recv_command, const char
          return -1;
      }
 
-    if (0 == strcmp(recv_command, "report_status")) { // local test
+    // signkey checking
+    if (0 != strcmp(recv_sign, signkey)) {
+         debug(LOG_ERR, "recv_sign %s != %s!", recv_sign, signkey);
+         return -1;       
+    }
+
+    if (0 == strcmp(recv_command, "report_status")) { // local test only
         // TODO update signkey
         gethostname(hostname, sizeof(hostname));
     	json_object_object_add(jobj,"command", json_object_new_string(recv_command));
     	json_object_object_add(jobj,"sign", json_object_new_string(recv_sign));
-        json_object_object_add(jobj,"newsign", json_object_new_string(org_sign));
-    	json_object_object_add(jobj,"result", json_object_new_string("0"));
-        json_object_object_add(jobj,"error_code", json_object_new_string(""));
-        //json_object_object_add(jobj,"hardware_no", json_object_new_string(hostname));
-        json_object_object_add(jobj,"use_status", json_object_new_string("1"));
-        json_object_object_add(jobj,"charging_type", json_object_new_string("2"));
-        json_object_object_add(jobj,"charging_time_s", json_object_new_string("201608121611"));
-        json_object_object_add(jobj,"charging_time_e", json_object_new_string("201609121611"));
-        json_object_object_add(jobj,"pour_timeout", json_object_new_string("30"));
+        json_object_object_add(jobj,"newsign", json_object_new_string(master_sign));
+    	json_object_object_add(jobj,"result", json_object_new_string(g_result));
+        json_object_object_add(jobj,"error_code", json_object_new_string(g_errorcode));
+        json_object_object_add(jobj,"use_status", json_object_new_string(g_use_status));
+        json_object_object_add(jobj,"charging_type", json_object_new_string(g_charging_type));
+        json_object_object_add(jobj,"charging_time_s", json_object_new_string(g_charging_time_s));
+        json_object_object_add(jobj,"charging_time_e", json_object_new_string(g_charging_time_e));
+        json_object_object_add(jobj,"pour_timeout", json_object_new_string(g_pour_timeout));
         memset(ip, 0, sizeof(ip));
         get_ip(config.ifname, ip, sizeof(ip));
         json_object_object_add(jobj,"machine_ip", json_object_new_string(ip));
-    } else if (0 == strcmp(recv_command, "get_detail")) {
+    } else if (0 == strcmp(recv_command, "get_detail")) { // query device status
    	    json_object_object_add(jobj,"command", json_object_new_string(recv_command));
     	json_object_object_add(jobj,"sign", json_object_new_string(recv_sign));
-    	json_object_object_add(jobj,"result", json_object_new_string("0"));
-        json_object_object_add(jobj,"error_code", json_object_new_string(""));
+    	json_object_object_add(jobj,"result", json_object_new_string(g_result));
+        json_object_object_add(jobj,"error_code", json_object_new_string(g_errorcode));
         gethostname(hostname, sizeof(hostname));
         json_object_object_add(jobj,"hardware_no", json_object_new_string(hostname));
         memset(ip, 0, sizeof(ip));
         get_ip(config.ifname, ip, sizeof(ip));
         json_object_object_add(jobj,"machine_ip", json_object_new_string(ip));
-        if (g_water_processing)
-            json_object_object_add(jobj,"use_status", json_object_new_string("3"));
-        else
-            json_object_object_add(jobj,"use_status", json_object_new_string("1"));
-            
+        json_object_object_add(jobj,"use_status", json_object_new_string(g_use_status));    
         json_object_object_add(jobj,"charging_type", json_object_new_string(g_charging_type));
         json_object_object_add(jobj,"charging_time_s", json_object_new_string(g_charging_time_s));
         json_object_object_add(jobj,"charging_time_e", json_object_new_string(g_charging_time_e));
-        json_object_object_add(jobj,"report_time", json_object_new_string("60"));
-        // DOTO check hardware
-        json_object_object_add(jobj,"device_status", json_object_new_string("301"));
-        json_object_object_add(jobj,"pour_timeout", json_object_new_string("30"));
+        json_object_object_add(jobj,"report_time", json_object_new_string(DEFAULT_REPORT_TIMEOUT));
+        json_object_object_add(jobj,"device_status", json_object_new_string(g_device_status));
+        json_object_object_add(jobj,"pour_timeout", json_object_new_string(g_pour_timeout));
     } else if (0 == strcmp(recv_command, "get_gap")) {
         json_object_object_get_ex(recv_jobj, "gap_no", &retobj);
         recv_item = json_object_get_string(retobj);
         if (NULL == recv_item) {
             debug(LOG_ERR, "%s no gap_no\n", __func__);
-            //return 5;
+            return -1;
         }
-        
+
+        json_object_object_get_ex(recv_jobj, "server_url", &retobj);
+        recv_item = json_object_get_string(retobj);
+        if (NULL == recv_item) {
+            debug(LOG_ERR, "%s no server_url\n", __func__);
+            return -1;
+        }
+
    	    json_object_object_add(jobj,"command", json_object_new_string(recv_command));
     	json_object_object_add(jobj,"sign", json_object_new_string(recv_sign));
-    	json_object_object_add(jobj,"result", json_object_new_string("0"));
-        json_object_object_add(jobj,"error_code", json_object_new_string(""));
+    	json_object_object_add(jobj,"result", json_object_new_string(g_result));
+        json_object_object_add(jobj,"error_code", json_object_new_string(g_errorcode));
         gethostname(hostname, sizeof(hostname));
         json_object_object_add(jobj,"hardware_no", json_object_new_string(hostname));
-        if (g_water_processing)
-            json_object_object_add(jobj,"use_status", json_object_new_string("3"));
-        else
-            json_object_object_add(jobj,"use_status", json_object_new_string("1"));
-        
+        json_object_object_add(jobj,"use_status", json_object_new_string(g_use_status));
         json_object_object_add(jobj,"gap_no", json_object_new_string(recv_item));
-        //sleep(4);
     } else if (0 == strcmp(recv_command, "change_status")) {
-        // TODO update local config charging_type 1/2 start/end time
+        // TODO save options to DB
+        json_object_object_get_ex(recv_jobj, "server_url", &retobj);
+        recv_item = json_object_get_string(retobj);
+        if (NULL == recv_item) {
+            debug(LOG_ERR, "%s no server_url\n", __func__);
+            return -1;
+        }
+        snprintf(g_server_url, sizeof(g_server_url), "%s", recv_item);
+
+        json_object_object_get_ex(recv_jobj, "token", &retobj);
+        recv_item = json_object_get_string(retobj);
+        if (NULL == recv_item) {
+            debug(LOG_ERR, "%s no token\n", __func__);
+            return -1;
+        }
+        snprintf(signkey, sizeof(signkey), "%s", recv_item);
+
+        json_object_object_get_ex(recv_jobj, "charging_type", &retobj);
+         recv_item = json_object_get_string(retobj);
+         if (NULL == recv_item) {
+             debug(LOG_ERR, "%s no charging_type\n", __func__);
+             return -1;
+         }
+         snprintf(g_charging_type, sizeof(g_charging_type), "%s", recv_item);
+
+        json_object_object_get_ex(recv_jobj, "charging_time_s", &retobj);
+         recv_item = json_object_get_string(retobj);
+         if (NULL == recv_item) {
+             debug(LOG_ERR, "%s no charging_time_s\n", __func__);
+             return -1;
+         }
+         snprintf(g_charging_time_s, sizeof(g_charging_time_s), "%s", recv_item);
+
+        json_object_object_get_ex(recv_jobj, "charging_time_e", &retobj);
+         recv_item = json_object_get_string(retobj);
+         if (NULL == recv_item) {
+             debug(LOG_ERR, "%s no charging_time_e\n", __func__);
+             return -1;
+         }
+         snprintf(g_charging_time_e, sizeof(g_charging_time_e), "%s", recv_item);
+
+        json_object_object_get_ex(recv_jobj, "use_status", &retobj);
+        recv_item = json_object_get_string(retobj);
+        if (NULL == recv_item) {
+            debug(LOG_ERR, "%s no use_status\n", __func__);
+            return -1;
+        }
+        snprintf(g_use_status, sizeof(g_use_status), "%s", recv_item);         
+
+        json_object_object_get_ex(recv_jobj, "pour_timeout", &retobj);
+        recv_item = json_object_get_string(retobj);
+        if (NULL == recv_item) {
+            debug(LOG_ERR, "%s no pour_timeout\n", __func__);
+            return -1;
+        }
+        snprintf(g_pour_timeout, sizeof(g_pour_timeout), "%s", recv_item);
+       
   	    json_object_object_add(jobj,"command", json_object_new_string(recv_command));
     	json_object_object_add(jobj,"sign", json_object_new_string(recv_sign));
-    	json_object_object_add(jobj,"result", json_object_new_string("0"));
-        json_object_object_add(jobj,"error_code", json_object_new_string(""));
+    	json_object_object_add(jobj,"result", json_object_new_string(g_result));
+        json_object_object_add(jobj,"error_code", json_object_new_string(g_errorcode));
         gethostname(hostname, sizeof(hostname));
         json_object_object_add(jobj,"hardware_no", json_object_new_string(hostname));
     } else if (0 == strcmp(recv_command, "pour")) { // water processing
@@ -540,24 +1203,80 @@ static int generate_json(json_object *jobj, const char *recv_command, const char
         recv_item = json_object_get_string(retobj);
         if (NULL == recv_item) {
             debug(LOG_ERR, "%s no gap_no\n", __func__);
-            //return 5;
+            return -1;
         }
-        // TODO water_time processing
-        g_water_processing = 1;
+        snprintf(g_gap_no, sizeof(g_gap_no), "%s", recv_item);
+        
+        json_object_object_get_ex(recv_jobj, "water_time", &retobj);
+        recv_item = json_object_get_string(retobj);
+        if (NULL == recv_item) {
+            debug(LOG_ERR, "%s no water_time\n", __func__);
+            return -1;
+        }
+        water_time = atoi(recv_item);
+        if ((water_time < 0) || (water_time > MAX_POUR_TIME_SECONDS)) {
+            debug(LOG_ERR, "%s water_time out of range\n", __func__);
+            return -1;
+        }
+        
+        start_pour = 0;
+        if (0 == strcmp(g_use_status, USE_STATUS_OFF)) {
+            snprintf(g_result, sizeof(g_result), "%s", RESULT_ABNORMAL);
+            snprintf(g_errorcode, sizeof(g_errorcode), "%s", "OFF");
+            start_pour |= 1; 
+        }
+
+        if (0 == strcmp(g_charging_type, CHARDING_TYPE_PERIOD)) {
+            // TODO time range check
+            t = time(NULL);
+            timeinfo = localtime(&t);
+            strftime(buffer, sizeof(buffer), "%Y%m%d%H%M", timeinfo);
+            if ((strcmp(buffer, g_charging_time_e) >= 0) 
+                || (strcmp(buffer, g_charging_time_s) <= 0)) {
+                snprintf(g_result, sizeof(g_result), "%s", RESULT_ABNORMAL);
+                snprintf(g_errorcode, sizeof(g_errorcode), "%s,%s", g_errorcode, "OFF");
+                start_pour |= 2;
+            }
+        }
+
+        if (g_water_processing) { // only support one 
+            snprintf(g_result, sizeof(g_result), "%s", RESULT_ABNORMAL);
+            snprintf(g_errorcode, sizeof(g_errorcode), "%s,%s", g_errorcode, "PROCESSING");
+            snprintf(g_use_status, sizeof(g_use_status), "%s", USE_STATUS_PROCESSING);
+            start_pour |= 4;
+        } 
+
+        if (0 == start_pour) {
+            pthread_mutex_lock(&processing_mutex);
+             g_water_processing = 1;
+             pthread_mutex_unlock(&processing_mutex);
+             snprintf(g_result, sizeof(g_result), "%s", RESULT_NORMAL);
+             snprintf(g_errorcode, sizeof(g_errorcode), "%s", "");
+             snprintf(g_use_status, sizeof(g_use_status), "%s", USE_STATUS_NORMAL);
+            
+            ret = pthread_create(&pourthread, 0 , pourthreadfunc, &water_time);
+            if ( 0 != ret) {
+                debug(LOG_ERR, "therea create fail %d", ret);    
+                return -1;
+            }            
+            pthread_detach(pourthread);
+        }
+        
   	    json_object_object_add(jobj,"command", json_object_new_string(recv_command));
     	json_object_object_add(jobj,"sign", json_object_new_string(recv_sign));
-    	json_object_object_add(jobj,"result", json_object_new_string("0"));
-        json_object_object_add(jobj,"error_code", json_object_new_string(""));
+    	json_object_object_add(jobj,"result", json_object_new_string(g_result));
+        json_object_object_add(jobj,"error_code", json_object_new_string(g_errorcode));
         gethostname(hostname, sizeof(hostname));
         json_object_object_add(jobj,"hardware_no", json_object_new_string(hostname));
-        json_object_object_add(jobj,"gap_no", json_object_new_string(recv_item));
+        json_object_object_add(jobj,"gap_no", json_object_new_string(g_gap_no));
+        json_object_object_add(jobj,"use_status", json_object_new_string(g_use_status));
+        json_object_object_add(jobj,"device_status", json_object_new_string(g_device_status));
         //sleep(150);
-    } else if (0 == strcmp(recv_command, "report_water")) {
-        // for local test
+    } else if (0 == strcmp(recv_command, "report_water")) {// for local test
   	    json_object_object_add(jobj,"command", json_object_new_string(recv_command));
     	json_object_object_add(jobj,"sign", json_object_new_string(recv_sign));
-    	json_object_object_add(jobj,"result", json_object_new_string("0"));
-        json_object_object_add(jobj,"error_code", json_object_new_string(""));
+    	json_object_object_add(jobj,"result", json_object_new_string(g_result));
+        json_object_object_add(jobj,"error_code", json_object_new_string(g_errorcode));
     }
     else {
         debug(LOG_ERR, "command error: %s", recv_command);
@@ -617,30 +1336,31 @@ static int print_out_key(void *cls, enum MHD_ValueKind kind, const char *key,
   return MHD_YES;
 }
 
-static int ahc_echo(void *cls,
+// thread accept http request
+static int http_callback(void *cls,
           struct MHD_Connection *connection,
           const char *url,
           const char *method,
           const char *version,
           const char *upload_data, size_t *upload_data_size, void **ptr)
 {
-  static int aptr;
-  const char *me = cls;
-  struct MHD_Response *response;
+    static int aptr;
+    const char *me = cls;
+    struct MHD_Response *response;
     const union MHD_ConnectionInfo * conninfo;
-  int ret;
-  char ip_str[36];
-  unsigned short ip_port;
-  const char *json_str = NULL;
-  json_object *jobj = NULL;
-  json_object *recv_json = NULL;
-  json_object *retobj = NULL;
-  int errorcode = 0;
-  json_bool jret;
-  int recv_length = 0;
-  const char *recv_command;
-  const char *recv_sign;
-  const char *hdr;
+    int ret;
+    char ip_str[36];
+    unsigned short ip_port;
+    const char *json_str = NULL;
+    json_object *jobj = NULL;
+    json_object *recv_json = NULL;
+    json_object *retobj = NULL;
+    int errorcode = 0;
+    json_bool jret;
+    int recv_length = 0;
+    const char *recv_command;
+    const char *recv_sign;
+    const char *hdr;
 
     MHD_get_connection_values(connection, MHD_HEADER_KIND, print_out_key, NULL);
 
@@ -650,40 +1370,43 @@ static int ahc_echo(void *cls,
     debug(LOG_DEBUG, "+%s method=%s url=%s version=%s ptr=%p *ptr=%p upload_data=%s size=%lu RemoteIP=%s port=%d", 
         __func__, method, url, version, ptr, *ptr, upload_data, *upload_data_size, ip_str, ip_port);
 
+    // Only accept POST
+    if (0 != strcmp(method, MHD_HTTP_METHOD_POST)) {
+       debug(LOG_ERR, "method=%s\n", method);
+        response = MHD_create_response_from_buffer(0, NULL, MHD_RESPMEM_PERSISTENT);
+        ret = MHD_queue_response(connection, MHD_HTTP_NOT_ACCEPTABLE, response);
+        MHD_destroy_response(response);
+        debug(LOG_ERR, "%s \n", __func__);
+        return ret;        
+    }
+
     // check http header
-    hdr = MHD_lookup_connection_value (connection,
-                                     MHD_HEADER_KIND, MHD_HTTP_HEADER_ACCEPT);
+    hdr = MHD_lookup_connection_value(connection, MHD_HEADER_KIND, MHD_HTTP_HEADER_ACCEPT);
 
     if ((hdr == NULL) || (0 != strcmp (hdr, "application/json"))) {
         debug(LOG_ERR, "HEADER_ACCEPT=%s\n", hdr);
-
-        response = MHD_create_response_from_buffer(0, NULL,
-					      MHD_RESPMEM_PERSISTENT);
+        response = MHD_create_response_from_buffer(0, NULL, MHD_RESPMEM_PERSISTENT);
         ret = MHD_queue_response(connection, MHD_HTTP_NOT_ACCEPTABLE, response);
         MHD_destroy_response(response);
         debug(LOG_ERR, "%s \n", __func__);
         return ret;
     }
 
-    hdr = MHD_lookup_connection_value (connection,
-                                     MHD_HEADER_KIND, MHD_HTTP_HEADER_CONTENT_TYPE);
+    hdr = MHD_lookup_connection_value(connection, MHD_HEADER_KIND, MHD_HTTP_HEADER_CONTENT_TYPE);
 
     if ((hdr == NULL) || (0 != strcmp (hdr, "application/json"))) {
         debug(LOG_ERR, "CONTENT_TYPE=%s\n", hdr);
-        response = MHD_create_response_from_buffer(0, NULL,
-					      MHD_RESPMEM_PERSISTENT);
+        response = MHD_create_response_from_buffer(0, NULL, MHD_RESPMEM_PERSISTENT);
         ret = MHD_queue_response(connection, MHD_HTTP_NOT_ACCEPTABLE, response);
         MHD_destroy_response(response);       
         debug(LOG_ERR, "%s \n", __func__);
         return ret;      
     }
-    hdr = MHD_lookup_connection_value (connection,
-                                     MHD_HEADER_KIND, MHD_HTTP_HEADER_CONTENT_LENGTH);
+    hdr = MHD_lookup_connection_value(connection, MHD_HEADER_KIND, MHD_HTTP_HEADER_CONTENT_LENGTH);
 
     if (hdr == NULL) {
         debug(LOG_ERR, "CONTENT_LENGTH=%s\n", hdr);
-          response = MHD_create_response_from_buffer(0, NULL,
-                            MHD_RESPMEM_PERSISTENT);
+          response = MHD_create_response_from_buffer(0, NULL, MHD_RESPMEM_PERSISTENT);
           ret = MHD_queue_response(connection, MHD_HTTP_NOT_ACCEPTABLE, response);
           MHD_destroy_response(response);
           return ret;
@@ -693,8 +1416,7 @@ static int ahc_echo(void *cls,
 
     if (recv_length > MAX_RECV) {
         debug(LOG_ERR, "CONTENT_LENGTH=%s\n", hdr);
-           response = MHD_create_response_from_buffer(0, NULL,
-                             MHD_RESPMEM_PERSISTENT);
+           response = MHD_create_response_from_buffer(0, NULL, MHD_RESPMEM_PERSISTENT);
            ret = MHD_queue_response(connection, MHD_HTTP_NOT_ACCEPTABLE, response);
            MHD_destroy_response(response);
         return ret;
@@ -757,15 +1479,8 @@ static int ahc_echo(void *cls,
         recv_command = json_object_get_string(retobj);
         jret = json_object_object_get_ex(recv_json, "sign", &retobj);
         recv_sign = json_object_get_string(retobj); 
-
-        // TODO check if there is newsign item ?
-        if (!memcpy(signkey, recv_sign, sizeof(signkey))) {
-            debug(LOG_ERR, "key fail! %s != %s\n", signkey, recv_sign);
-            // FIXME return generate_json_error
-        }
-        //memcpy(signkey, recv_sign, sizeof(signkey));
-        
-        generate_json(jobj, recv_command, recv_sign, recv_json);
+       
+        process_logic(jobj, recv_command, recv_sign, recv_json);
     }
 
     json_str = json_object_to_json_string(jobj);
@@ -867,38 +1582,6 @@ int handle_request(void *cls, struct MHD_Connection *connection,
         return ret;
 }
 #endif
-
-static size_t curl_callback(void *contents, size_t size, size_t nmemb, void *userp) 
-{
-    size_t realsize = size * nmemb;                             /* calculate buffer size */
-    struct curl_fetch_st *p = (struct curl_fetch_st *) userp;   /* cast pointer to fetch struct */
-
-    //printf("%s %p\n", __func__, userp);
-    /* expand buffer */
-    p->payload = (char *) realloc(p->payload, p->size + realsize + 1);
-
-    /* check buffer */
-    if (p->payload == NULL) {
-      /* this isn't good */
-      debug(LOG_ERR, "ERROR: Failed to expand buffer in %s", __func__);
-      /* free buffer */
-      free(p->payload);
-      /* return */
-      return -1;
-    }
-
-    /* copy contents to buffer */
-    memcpy(&(p->payload[p->size]), contents, realsize);
-
-    /* set new buffer size */
-    p->size += realsize;
-
-    /* ensure null termination */
-    p->payload[p->size] = 0;
-
-    /* return size */
-    return realsize;
-}
 
 // send http POST to server
 static int postip(char *url)
@@ -1046,179 +1729,7 @@ static int postip(char *url)
         debug(LOG_ERR, "%s no new signkey\n", __func__);
         return 5;
     }
-    memcpy(signkey, recv_item, sizeof(signkey) - 1);
-    debug(LOG_DEBUG, "newsign=%s signkey=%s\n", recv_item, signkey);
-
-    json_object_object_get_ex(jobj, "charging_type", &retobj);
-    recv_item = json_object_get_string(retobj);
-    if (NULL == recv_item) {
-        debug(LOG_ERR, "%s no charging_type\n", __func__);
-        return 5;
-    }
-    memcpy(g_charging_type, recv_item, sizeof(g_charging_type) - 1);
-    debug(LOG_DEBUG, "charging_type=%s\n", recv_item);
-
-    json_object_object_get_ex(jobj, "charging_time_s", &retobj);
-    recv_item = json_object_get_string(retobj);
-    if (NULL == recv_item) {
-        debug(LOG_ERR, "%s no charging_time_s\n", __func__);
-        return 5;
-    }
-    memcpy(g_charging_time_s, recv_item, sizeof(g_charging_time_s) - 1);
-    debug(LOG_DEBUG, "charging_time_s=%s\n", recv_item);
-
-    json_object_object_get_ex(jobj, "charging_time_e", &retobj);
-     recv_item = json_object_get_string(retobj);
-     if (NULL == recv_item) {
-         debug(LOG_ERR, "%s no charging_time_e\n", __func__);
-         return 5;
-     }
-     memcpy(g_charging_time_e, recv_item, sizeof(g_charging_time_e) - 1);
-     debug(LOG_DEBUG, "charging_time_e=%s\n", recv_item);
-
-
-    if (jobj != NULL) {
-        debug(LOG_DEBUG, "%s Free JSON\n", __func__);
-        json_object_put(jobj);
-    }
-
-    return 0;
-
-}
-
-static int report_water(char *url)
-{
-    char hostname[HOST_NAME_MAX];
-    const char *recv_item = NULL;
-    json_object *jobj;
-    json_object *retobj;
-    enum json_tokener_error jerr = json_tokener_success;
-
-    CURL *ch;                                               /* curl handle */
-    CURLcode rcode;
-    struct curl_slist *headers = NULL;
-    struct curl_fetch_st curl_fetch;                        /* curl fetch struct */
-    struct curl_fetch_st *cf = &curl_fetch;                 /* pointer to fetch struct */
-
-    cf->size = 0;
-    cf->payload = (char *) calloc(1, sizeof(cf->payload));
-
-    if (cf->payload == NULL) {
-        debug(LOG_ERR, "Failed to allocate payload in curl_fetch_url");
-        return -1;
-    }
-
-    /* init curl handle */
-    if ((ch = curl_easy_init()) == NULL) {
-        /* log error */
-        debug(LOG_ERR, "ERROR: Failed to create curl handle in fetch_session");
-        /* return error */
-        return 1;
-    }
-
-    /* set content type */
-    headers = curl_slist_append(headers, "Accept: application/json");
-    headers = curl_slist_append(headers, "Content-Type: application/json");
-
-    jobj = json_object_new_object();
-
-    if (gethostname(hostname, sizeof(hostname)) != 0) {
-        debug(LOG_ERR, "gethostname failed with %d\n", errno);
-    }
-
-    gethostname(hostname, sizeof(hostname));
-    json_object_object_add(jobj,"command", json_object_new_string("report_water"));
-    json_object_object_add(jobj,"sign", json_object_new_string(signkey));
-    json_object_object_add(jobj,"hardware_no", json_object_new_string(hostname));
-    //TODO get device use_status and hardware status
-    json_object_object_add(jobj,"gap_no", json_object_new_string("A001B"));
-    json_object_object_add(jobj,"water_time", json_object_new_string("20"));
-        
-    debug(LOG_DEBUG, "json='%s', len=%lu\n", json_object_to_json_string(jobj), strlen(json_object_to_json_string(jobj)));
-    debug(LOG_DEBUG, "url=%s\n", url);
-
-    /* set curl options */
-    curl_easy_setopt(ch, CURLOPT_CUSTOMREQUEST, "POST");
-    curl_easy_setopt(ch, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(ch, CURLOPT_POSTFIELDS, json_object_to_json_string(jobj));
-    /* set timeout */
-    curl_easy_setopt(ch, CURLOPT_TIMEOUT, (long)155);
     
-    /* set url to fetch */
-    curl_easy_setopt(ch, CURLOPT_URL, url);
-
-    /* set calback function */
-    curl_easy_setopt(ch, CURLOPT_WRITEFUNCTION, curl_callback);
-
-    /* pass fetch struct pointer */
-    curl_easy_setopt(ch, CURLOPT_WRITEDATA, (void *) cf);
-
-    /* set default user agent */
-    curl_easy_setopt(ch, CURLOPT_USERAGENT, "libcurl-agent/1.0");
-
-    /* enable location redirects */
-    curl_easy_setopt(ch, CURLOPT_FOLLOWLOCATION, 1);
-
-    /* set maximum allowed redirects */
-    curl_easy_setopt(ch, CURLOPT_MAXREDIRS, 1);
-    curl_easy_setopt(ch, CURLOPT_VERBOSE, 1L);
-
-    /* fetch the url */
-    rcode = curl_easy_perform(ch);
-
-    //rcode = curl_fetch_url(ch, url, cf);
-    curl_easy_cleanup(ch);
-    curl_slist_free_all(headers);
-    if (jobj != NULL) {
-        debug(LOG_DEBUG, "Free JSON");
-        json_object_put(jobj);
-    }
-
-    if (rcode != CURLE_OK || cf->size < 1) {
-            /* log error */
-            debug(LOG_ERR, "%s Failed to fetch url (%s) '%s'", __func__, 
-                url, curl_easy_strerror(rcode));
-            /* return error */
-            return 2;
-     }
-
-    /* check payload */
-    if (cf->payload != NULL) {
-        /* print result */
-        debug(LOG_DEBUG, "CURL Returned: %s len=%lu\n", cf->payload, strlen(cf->payload));
-        /* parse return */
-        jobj = json_tokener_parse(cf->payload); //json_tokener_parse_verbose(cf->payload, &jerr);
-        /* free payload */
-        free(cf->payload);
-    } else {
-        /* error */
-        debug(LOG_ERR, "Failed to populate payload");
-        /* free payload */
-        free(cf->payload);
-        /* return */
-        return 3;
-    }
-
-    /* check error */
-    if (jobj == NULL) {
-        /* error */
-        debug(LOG_ERR, "ERROR: Failed to parse json string");
-        /* free json object */
-        json_object_put(jobj);
-        /* return */
-        return 4;
-    }
-
-    /* debugging */
-    debug(LOG_DEBUG, "%s Parsed JSON: %s\n", __func__, json_object_to_json_string(jobj));
-
-    // parse config data from the JSON string
-    json_object_object_get_ex(jobj, "newsign", &retobj);
-    recv_item = json_object_get_string(retobj);
-    if (NULL == recv_item) {
-        debug(LOG_ERR, "%s no new signkey\n", __func__);
-        return 5;
-    }
     memcpy(signkey, recv_item, sizeof(signkey) - 1);
     debug(LOG_DEBUG, "newsign=%s signkey=%s\n", recv_item, signkey);
 
@@ -1256,9 +1767,10 @@ static int report_water(char *url)
     }
 
     return 0;
+
 }
 
-// send http post to server
+// thread: send IP to server and update local sign key
 static void *postthreadfunc(void *arg)
 {
     char *p = NULL;
@@ -1269,7 +1781,7 @@ static void *postthreadfunc(void *arg)
     debug(LOG_DEBUG, "+%s", __func__);
     while (1) {
         if (check_ip()) { // IP changed, send the IP using orgsign
-            memcpy(signkey, org_sign, sizeof(signkey));
+            memcpy(signkey, master_sign, sizeof(signkey));
             postip(config.serverurl);     
         } else { // The same IP report heartbeat very 60 seconds
             if ((count * config.interval) >= 60) {
@@ -1280,13 +1792,6 @@ static void *postthreadfunc(void *arg)
         count++;
         debug(LOG_DEBUG, "%s sleep %d", __func__, config.interval);        
         sleep(config.interval);
-
-        // TODO add mutex
-        // test report_water
-        if (g_water_processing) {
-            report_water(config.serverurl);
-            g_water_processing = 0;
-        }
     }
 
     debug(LOG_DEBUG, "-%s", __func__);    
@@ -1307,6 +1812,7 @@ notify_connection_cb(void *cls, struct MHD_Connection *connection, void **socket
     //MHD_get_daemon_info(conninfo->daemon, MHD_DAEMON_INFO_CURRENT_CONNECTIONS);
 }
 
+// main thread
 static int httpserver()
 {
     struct MHD_Daemon *d;
@@ -1320,7 +1826,7 @@ static int httpserver()
 			//MHD_USE_SELECT_INTERNALLY | MHD_USE_DEBUG,
 			MHD_USE_THREAD_PER_CONNECTION | MHD_USE_DEBUG ,
                         config.port,
-                        NULL, NULL, &ahc_echo, PAGE,
+                        NULL, NULL, &http_callback, PAGE,
 			MHD_OPTION_CONNECTION_TIMEOUT, (unsigned int) 5,
 	        //MHD_OPTION_THREAD_POOL_SIZE, (unsigned int) 1,
 	        MHD_OPTION_CONNECTION_LIMIT, (unsigned int)1,
@@ -1363,9 +1869,25 @@ int main(int argc, char  **argv)
 {
     int ret = 0;
 
-    
+    // TODO hardware checking
+    snprintf(g_device_status, sizeof(g_device_status), "%s", HARDWARE_DEVICE_NORMAL);
+
+    // TODO query settings from DB    
+    snprintf(g_charging_type, sizeof(g_charging_type), "%s", CHARDING_TYPE_COUNT);
+    snprintf(g_charging_time_s, sizeof(g_charging_time_s), "%s", "201608121611");
+    snprintf(g_charging_time_e, sizeof(g_charging_time_e), "%s", "201609121611");    
+
+    snprintf(g_result, sizeof(g_result), "%s", RESULT_NORMAL);
+
+    // TODO set status based on time period
+    snprintf(g_use_status, sizeof(g_use_status), "%s", USE_STATUS_NORMAL);
+
+    snprintf(g_pour_timeout, sizeof(g_pour_timeout), "%s", DEFAULT_POUR_TIMEOUT);
+
     printf("%s\n", __func__);
     printf("%s tid=%lu\n", __func__, syscall(SYS_gettid));
+
+    pthread_mutex_init(&processing_mutex, NULL);
 
     if (sem_init(&stopsem, 0, 0) == -1) {
         debug(LOG_ERR, "sem_init");
@@ -1382,6 +1904,8 @@ int main(int argc, char  **argv)
     parse_commandline(argc, argv);
 
     config_dump();
+
+    snprintf(g_server_url, sizeof(g_server_url), "%s", config.serverurl);
 
     //debug(LOG_DEBUG, "start process for httpserver daemon=%d", config.daemon);
 	if (config.daemon) {
@@ -1403,6 +1927,7 @@ int main(int argc, char  **argv)
 	}
 
     sem_destroy(&stopsem);
+    pthread_mutex_destroy(&processing_mutex);
     debug(LOG_NOTICE, "main return 0...");
 	return(0); /* never reached */
 }

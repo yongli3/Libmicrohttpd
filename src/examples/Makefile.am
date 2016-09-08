@@ -61,7 +61,7 @@ minimal_example_SOURCES = \
  minimal_example.c
 minimal_example_LDADD = \
  $(top_builddir)/src/microhttpd/libmicrohttpd.la \
- -ljson-c -luriparser -lcurl
+ -ljson-c -luriparser -lcurl -lm -lsqlite3
 
 timeout_SOURCES = \
  timeout.c
