@@ -79,6 +79,7 @@ curl -vvv -H "Connection: Close" -H "Content-Type: application/json" -H "accept:
 #define HARDWARE_DEVICE_ERROR  ("500")
 #define HARDWARE_DEVICE_NORMAL  ("501")
 
+// JSON/HTTP result
 #define RESULT_NORMAL           ("0")
 #define RESULT_ABNORMAL         ("1")
 
@@ -87,11 +88,22 @@ curl -vvv -H "Connection: Close" -H "Content-Type: application/json" -H "accept:
 #define USE_STATUS_PROCESSING   ("3")
 #define USE_STATUS_ABNORMAL     ("4")
 
-#define CHARDING_TYPE_COUNT     ("1")
-#define CHARDING_TYPE_PERIOD    ("2")
+#define CHARGING_TYPE_COUNT     ("1")
+#define CHARGING_TYPE_PERIOD    ("2")
 
 #define DEFAULT_POUR_TIMEOUT    ("30")
-#define DEFAULT_REPORT_TIMEOUT  ("60")
+#define DEFAULT_REPORT_TIMEOUT  ("600")
+
+#define COMMANDNAME_REPORT_STATUS  ("report_status")
+#define COMMANDNAME_REPORT_WATER  ("report_water")
+
+#define KEYNAME_CHARGING_TYPE  ("charging_type")
+#define KEYNAME_CHARGING_TIME_S  ("charging_time_s")
+#define KEYNAME_CHARGING_TIME_E  ("charging_time_e")
+#define KEYNAME_USE_STATUS          ("use_status")
+#define KEYNAME_POUR_TIMEOUT        ("pour_timeout")
+#define KEYNAME_SERVER_URL          ("server_url")
+#define KEYNAME_REPORT_TIME         ("report_time")
 
 //bool stophttp = false;
 
@@ -108,7 +120,8 @@ struct curl_fetch_st {
 };
 
 typedef struct {
-    char configfile[64];
+    char dbfile[32];
+    char configfile[32];
     int daemon;
     int debuglevel;
     int port;
@@ -118,7 +131,7 @@ typedef struct {
 } s_config;
 
 static s_config config;
-static unsigned char signkey[33];
+static unsigned char signkey[33] = "d53fd9852538440c926765dd69927a2c";
 static unsigned char *master_sign = "d53fd9852538440c926765dd69927a2c";
 
 static unsigned char g_server_url[64];
@@ -129,12 +142,14 @@ static unsigned char g_result[2];
 static unsigned char g_errorcode[32];
 static unsigned char g_use_status[2];
 static unsigned char g_charging_type[2];
-
 static unsigned char g_charging_time_s[13];
 static unsigned char g_charging_time_e[13];
 static unsigned char g_water_processing = 0;
-static unsigned char  g_pour_timeout[3];
-static unsigned char g_dbname[32];
+static unsigned char  g_pour_timeout[4];
+static unsigned char  g_ipcheck_time[4];
+int g_water_time;
+
+//static unsigned char g_dbname[32];
 
 static pthread_mutex_t processing_mutex;
 
@@ -162,20 +177,30 @@ static void _debug(const char filename[], int line, int level, const char *forma
 
 static void config_init() 
 {
+    snprintf(config.dbfile, sizeof(config.dbfile), "%s", "./client.db");
     strncpy(config.configfile, "/etc/client.conf", sizeof(config.configfile) - 1);
     config.daemon = 0;
     config.debuglevel = LOG_DEBUG;
     config.port = 8080;
-    config.interval = 200;
+    config.interval = 20; // IP checking
     strncpy(config.serverurl, "http://localhost:8080/", sizeof(config.serverurl) - 1);
     strncpy(config.ifname, "eth0", sizeof(config.ifname) - 1);
 }
 
+static void status_dump() 
+{
+    debug(LOG_DEBUG, "dbfile=%s conffile=%s serverurl=%s ifname=%s daemon=%d debuglevel=%d port=%d interval=%d", 
+        config.dbfile, config.configfile, config.serverurl, config.ifname, 
+        config.daemon, config.debuglevel, config.port, config.interval);
+    return;
+}
+
 static void config_dump() 
 {
-    debug(LOG_DEBUG, "conffile=%s serverurl=%s ifname=%s daemon=%d debuglevel=%d port=%d interval=%d", 
-        config.configfile, config.serverurl, config.ifname, 
+    debug(LOG_DEBUG, "dbfile=%s conffile=%s serverurl=%s ifname=%s daemon=%d debuglevel=%d port=%d interval=%d", 
+        config.dbfile, config.configfile, config.serverurl, config.ifname, 
         config.daemon, config.debuglevel, config.port, config.interval);
+    return;
 }
 
 static s_config *config_get_config(void)
@@ -291,21 +316,7 @@ static int update_callback(void *data, int argc, char **argv, char **azColName){
    return 0;
 }
 
-static int select_callback(void *data, int argc, char **argv, char **azColName)
-{
-    int i;
-   
-    printf("+%s\n", __func__);
- 
-   for(i=0; i<argc; i++){
-      printf("%s = %s\n", azColName[i], argv[i] ? argv[i] : "NULL");
-      strcpy(data, argv[i]);
-      break;
-   }
-   return 0;
-}
-
-static int insert(char *key, char *value)
+static int set_data(char *key, char *value)
 {
     sqlite3 *db = NULL;
     char *zErrMsg = 0;
@@ -314,7 +325,13 @@ static int insert(char *key, char *value)
     char *data = "";
 
     ret = -1;
-    rc = sqlite3_open(g_dbname, &db);
+
+    if (0 == strlen(config.dbfile)) {
+        debug(LOG_ERR, "dbfile error!\n");
+        return ret;
+    }
+    
+    rc = sqlite3_open(config.dbfile, &db);
     if( rc ){
           fprintf(stderr, "Can't open database: %s\n", sqlite3_errmsg(db));
           return ret;
@@ -322,7 +339,8 @@ static int insert(char *key, char *value)
           fprintf(stdout, "Opened database successfully\n");
     }
 
-    snprintf(sql, sizeof(sql), "insert or replace into config (id, key, value) values ((select id from config where key=\"%s\"), \"%s\", \"%s\")", key, key, value);
+    snprintf(sql, sizeof(sql), "insert or replace into config (id, key, value) values ((select id from config where key=\"%s\"), \"%s\", \"%s\")", 
+        key, key, value);
 
     rc = sqlite3_exec(db, sql, update_callback, (void*)data, &zErrMsg);
     if( rc != SQLITE_OK ){
@@ -330,7 +348,7 @@ static int insert(char *key, char *value)
         sqlite3_free(zErrMsg);          
      }else{
         ret = 0;
-        fprintf(stdout, "Operation done successfully\n");
+        //fprintf(stdout, "Operation done successfully\n");
      }
 
     if (db)
@@ -338,6 +356,59 @@ static int insert(char *key, char *value)
 
     return ret;
 
+}
+
+static int select_callback(void *data, int argc, char **argv, char **azColName)
+{
+    int i;
+   
+    debug(LOG_DEBUG, "+%s\n", __func__);
+ 
+   for(i=0; i<argc; i++){
+      debug(LOG_DEBUG, "%s = %s\n", azColName[i], argv[i] ? argv[i] : "NULL");
+      strcpy(data, argv[i]);
+      break;
+   }
+   return 0;
+}
+
+static int get_data(char *key, char *value)
+{
+    sqlite3 *db = NULL;
+    char *zErrMsg = 0;
+    int  rc, ret;
+    char sql[256];
+
+    ret = -1;
+
+    if (0 == strlen(config.dbfile)) {
+        debug(LOG_ERR, "dbfile error!\n");
+        return ret;
+    }
+
+    rc = sqlite3_open(config.dbfile, &db);
+    if( rc ){
+          debug(LOG_ERR, "Can't open database: %s\n", sqlite3_errmsg(db));
+          return ret;
+    }else{
+          debug(LOG_DEBUG, "Opened database %s successfully\n", config.dbfile);
+    }
+
+    snprintf(sql, sizeof(sql), "select value from config where key = \"%s\"", key);
+    debug(LOG_DEBUG, "exec sql [%s]\n", sql);
+    rc = sqlite3_exec(db, sql, select_callback, (void*)value, &zErrMsg);
+    if( rc != SQLITE_OK ){
+       debug(LOG_ERR, "SQL error: %s\n", zErrMsg);
+       sqlite3_free(zErrMsg);         
+    }else{
+       //fprintf(stdout, "Operation done successfully value=[%s]\n", value);
+       ret = 0;
+    }  
+    
+    if (db)
+        sqlite3_close(db);
+
+    return ret;
 }
 
 
@@ -684,19 +755,22 @@ static int gpio_poll(int gpio, int time_seconds)
     sigset_t emptyset;
     struct pollfd fds = {0};
 
+    debug(LOG_DEBUG, "+%s %d-%d\n", __func__, gpio, time_seconds);
+
     gpio_export(gpio);
     gpio_set_dir(gpio, 0);
     gpio_set_edge(gpio, "both");
     
     snprintf(buf, sizeof(buf), SYSFS_GPIO_DIR "/gpio%d/value", gpio);
     fd = open(buf , O_RDONLY);
-    printf("path = %s fd = %d\n", buf, fd);
+    debug(LOG_DEBUG, "path = %s fd = %d\n", buf, fd);
 
     fds.fd = fd;
     fds.events = POLLPRI;
     sigemptyset(&emptyset);
     total_ms = 0;
     key_is_pressing = 0;
+    key_pressed = 0;
     water_seconds = time_seconds;
     left_ms = water_seconds * 1000;
     last_pressed_second = 0;    
@@ -710,29 +784,29 @@ static int gpio_poll(int gpio, int time_seconds)
         if ((wait_ms + total_ms) > ((10+water_seconds)*1000)) { 
             wait_ms = ((10+water_seconds)*1000) - total_ms;
         }
-        printf("**poll left=%d passed=%d wait=%d\n", left_ms, total_ms, wait_ms);
+        debug(LOG_DEBUG, "**poll left=%d passed=%d wait=%d\n", left_ms, total_ms, wait_ms);
         ret = poll(&fds, 1, wait_ms);
         // get data or timeout or error
         if (0 == ret) { // timeout, no change on GPIO            
             total_ms += wait_ms;
-            printf("timeout %d-%d-%d ", wait_ms, left_ms, total_ms);
+            debug(LOG_DEBUG, "timeout %d-%d-%d ", wait_ms, left_ms, total_ms);
             lseek(fd, 0, SEEK_SET);
             if (read(fd, val, 2 * sizeof(char)) != 2)
-                printf("could not read value\n");
+                debug(LOG_DEBUG, "could not read value\n");
             else { // check gpio value
                 key_value = strtol(val, NULL, 10); // 0 = pressed
                 key_pressed = key_value ? 0:1;
-                printf("key %s\n", key_value ? "release":"pressed");
+                debug(LOG_DEBUG, "key %s\n", key_value ? "release":"pressed");
             }
 
             if (key_pressed) { // keep pressed & timeout
-                printf("MUST-STOP left=%d pressed_ms=%d\n", left_ms, wait_ms);
+                debug(LOG_DEBUG, "MUST-STOP left=%d pressed_ms=%d\n", left_ms, wait_ms);
                 left_ms -= wait_ms;
                 break;
             }
             
         } else if (ret < 0) {
-            printf("error %s\n", strerror(errno));
+            debug(LOG_DEBUG, "error %s\n", strerror(errno));
             total_ms += 1000;
         } else {// get data
             clock_gettime(CLOCK_REALTIME, &spec);
@@ -741,14 +815,14 @@ static int gpio_poll(int gpio, int time_seconds)
             total_ms = total_ms + (current_second - last_second) * 1000
                 + (current_millisecond - last_millisecond);
             
-            printf("%d ret=%d response events: 0x%X ", key_is_pressing, ret, fds.revents);        
+            debug(LOG_DEBUG, "%d ret=%d response events: 0x%X ", key_is_pressing, ret, fds.revents);        
             lseek(fd, 0, SEEK_SET);
             if (read(fd, val, 2 * sizeof(char)) != 2)
-                printf("could not read value\n");
+                debug(LOG_DEBUG, "could not read value\n");
             else { // check gpio value
                 key_value = strtol(val, NULL, 10);
                 key_pressed = key_value ? 0:1;
-                printf("key %s\n", key_value ? "release":"pressed");
+                debug(LOG_DEBUG, "key %s\n", key_value ? "release":"pressed");
                 if (key_pressed) {
                     if (0 == last_pressed_second) { // first time pressed
                         last_pressed_second = current_second;
@@ -756,7 +830,7 @@ static int gpio_poll(int gpio, int time_seconds)
                         key_is_pressing = 1;
                     } else { // pressed not the first time
                         if (key_is_pressing) { // pressed->pressed
-                            printf("impossible pressed!\n"); // 
+                            debug(LOG_DEBUG, "impossible pressed!\n"); // 
                         } else { // release->pressed
                             last_pressed_second = current_second;
                             last_pressed_millisecond = current_millisecond;
@@ -766,20 +840,20 @@ static int gpio_poll(int gpio, int time_seconds)
                 } else { // key release
                     if (0 == last_pressed_second) { //no pressed
                         if (key_is_pressing) {// pressed->release
-                            printf("impossible p->r\n");
+                            debug(LOG_DEBUG, "impossible p->r\n");
                         } else { // release->release
-                            printf("first released!\n");
+                            debug(LOG_DEBUG, "first released!\n");
                         }
 
                     } else {// pressed before
                         if (key_is_pressing) {//press->release
-                            printf("left_ms=%d pressed_ms=%lu\n", left_ms, 1000 * (current_second - last_pressed_second) 
+                            debug(LOG_DEBUG, "left_ms=%d pressed_ms=%lu\n", left_ms, 1000 * (current_second - last_pressed_second) 
                             + (current_millisecond - last_pressed_millisecond));
                             left_ms = left_ms - 
                            1000 * (current_second - last_pressed_second) 
                             - (current_millisecond - last_pressed_millisecond);
                         } else {//relase->release
-                            printf("impossible r->r\n");
+                            debug(LOG_DEBUG, "impossible r->r\n");
                         }
                         //difftime                                                              
                     }
@@ -789,11 +863,12 @@ static int gpio_poll(int gpio, int time_seconds)
         }
     }
 
-    printf("total=%d left=%d\n", total_ms, left_ms);
+    debug(LOG_DEBUG, "total=%d left=%d\n", total_ms, left_ms);
     
     close(fd);
 
     gpio_unexport(gpio);
+    debug(LOG_DEBUG, "-%s %d-%d return=%d\n", __func__, gpio, time_seconds, left_ms);    
     return left_ms;
 }
 
@@ -830,8 +905,9 @@ static size_t curl_callback(void *contents, size_t size, size_t nmemb, void *use
 }
 
 // send result to server after processing POUT command
-static int report_water(char *url, int water_time)
+static int report_water(char *url, int water_time_second)
 {
+    unsigned char tmpkey[33];
     char str_time[32];
     char hostname[HOST_NAME_MAX];
     const char *recv_item = NULL;
@@ -845,7 +921,7 @@ static int report_water(char *url, int water_time)
     struct curl_fetch_st curl_fetch;                        /* curl fetch struct */
     struct curl_fetch_st *cf = &curl_fetch;                 /* pointer to fetch struct */
 
-    snprintf(str_time, sizeof(str_time), "%f", (water_time/1000.0));
+    snprintf(str_time, sizeof(str_time), "%d", (water_time_second));
 
     cf->size = 0;
     cf->payload = (char *) calloc(1, sizeof(cf->payload));
@@ -869,13 +945,13 @@ static int report_water(char *url, int water_time)
 
     jobj = json_object_new_object();
 
+    snprintf(tmpkey, sizeof(tmpkey), "%s", signkey);
     if (gethostname(hostname, sizeof(hostname)) != 0) {
         debug(LOG_ERR, "gethostname failed with %d\n", errno);
     }
 
-    gethostname(hostname, sizeof(hostname));
-    json_object_object_add(jobj,"command", json_object_new_string("report_water"));
-    json_object_object_add(jobj,"sign", json_object_new_string(signkey));
+    json_object_object_add(jobj,"command", json_object_new_string(COMMANDNAME_REPORT_WATER));
+    json_object_object_add(jobj,"sign", json_object_new_string(tmpkey));
     json_object_object_add(jobj,"hardware_no", json_object_new_string(hostname));
     //TODO get device use_status and hardware status
     json_object_object_add(jobj,"gap_no", json_object_new_string(g_gap_no));
@@ -959,43 +1035,18 @@ static int report_water(char *url, int water_time)
     /* debugging */
     debug(LOG_DEBUG, "%s Parsed JSON: %s\n", __func__, json_object_to_json_string(jobj));
 
-    // parse config data from the JSON string
-    json_object_object_get_ex(jobj, "newsign", &retobj);
+    // TODO key checking
+    json_object_object_get_ex(jobj, "sign", &retobj);
     recv_item = json_object_get_string(retobj);
     if (NULL == recv_item) {
         debug(LOG_ERR, "%s no new signkey\n", __func__);
         return 5;
     }
-    memcpy(signkey, recv_item, sizeof(signkey) - 1);
-    debug(LOG_DEBUG, "newsign=%s signkey=%s\n", recv_item, signkey);
 
-    json_object_object_get_ex(jobj, "charging_type", &retobj);
-    recv_item = json_object_get_string(retobj);
-    if (NULL == recv_item) {
-        debug(LOG_ERR, "%s no charging_type\n", __func__);
-        return 5;
+    if (0 != strcmp(recv_item, tmpkey)) {
+         debug(LOG_ERR, "recv_sign %s != %s!", recv_item, tmpkey);
+         return -1;       
     }
-    memcpy(g_charging_type, recv_item, sizeof(g_charging_type) - 1);
-    debug(LOG_DEBUG, "charging_type=%s\n", recv_item);
-
-    json_object_object_get_ex(jobj, "charging_time_s", &retobj);
-    recv_item = json_object_get_string(retobj);
-    if (NULL == recv_item) {
-        debug(LOG_ERR, "%s no charging_time_s\n", __func__);
-        return 5;
-    }
-    memcpy(g_charging_time_s, recv_item, sizeof(g_charging_time_s) - 1);
-    debug(LOG_DEBUG, "charging_time_s=%s\n", recv_item);
-
-    json_object_object_get_ex(jobj, "charging_time_e", &retobj);
-     recv_item = json_object_get_string(retobj);
-     if (NULL == recv_item) {
-         debug(LOG_ERR, "%s no charging_time_e\n", __func__);
-         return 5;
-     }
-     memcpy(g_charging_time_e, recv_item, sizeof(g_charging_time_e) - 1);
-     debug(LOG_DEBUG, "charging_time_e=%s\n", recv_item);
-
 
     if (jobj != NULL) {
         debug(LOG_DEBUG, "%s Free JSON\n", __func__);
@@ -1010,26 +1061,23 @@ static void *pourthreadfunc(void *arg)
 {
     int *water_time = (int *) arg;
     int fd, ret;
-    unsigned int remaining_time;
     unsigned char c;
     struct pollfd fdset;
 
-    debug(LOG_DEBUG, "%s water_time=%d", __func__, *water_time);
+    debug(LOG_DEBUG, "+%s water_time=%d %p", __func__, *water_time, arg);
 
     // TODO power on
 
-    remaining_time = 1000 * (*water_time + atoi(DEFAULT_REPORT_TIMEOUT));
-
     ret = gpio_poll(POUR_GPIO, *water_time);
 
-    report_water(g_server_url, *water_time - ret);
+    report_water(g_server_url, *water_time - ret/1000);
 
     pthread_mutex_lock(&processing_mutex);
     g_water_processing = 0;
-    pthread_mutex_unlock(&processing_mutex);
     snprintf(g_use_status, sizeof(g_use_status), "%s", USE_STATUS_NORMAL);
-    
-    
+    pthread_mutex_unlock(&processing_mutex);
+
+    debug(LOG_DEBUG, "-%s water_time=%d", __func__, *water_time);    
     return NULL;
 }
 
@@ -1078,22 +1126,19 @@ static int process_logic(json_object *jobj, const char *recv_command, const char
          return -1;       
     }
 
-    if (0 == strcmp(recv_command, "report_status")) { // local test only
+    if (0 == strcmp(recv_command, COMMANDNAME_REPORT_STATUS)) { // local test only
         // TODO update signkey
         gethostname(hostname, sizeof(hostname));
     	json_object_object_add(jobj,"command", json_object_new_string(recv_command));
     	json_object_object_add(jobj,"sign", json_object_new_string(recv_sign));
         json_object_object_add(jobj,"newsign", json_object_new_string(master_sign));
     	json_object_object_add(jobj,"result", json_object_new_string(g_result));
-        json_object_object_add(jobj,"error_code", json_object_new_string(g_errorcode));
-        json_object_object_add(jobj,"use_status", json_object_new_string(g_use_status));
-        json_object_object_add(jobj,"charging_type", json_object_new_string(g_charging_type));
+        json_object_object_add(jobj,"error_code", json_object_new_string(""));
+        json_object_object_add(jobj,"use_status", json_object_new_string(USE_STATUS_NORMAL));
+        json_object_object_add(jobj,KEYNAME_CHARGING_TYPE, json_object_new_string(CHARGING_TYPE_COUNT));
         json_object_object_add(jobj,"charging_time_s", json_object_new_string(g_charging_time_s));
         json_object_object_add(jobj,"charging_time_e", json_object_new_string(g_charging_time_e));
         json_object_object_add(jobj,"pour_timeout", json_object_new_string(g_pour_timeout));
-        memset(ip, 0, sizeof(ip));
-        get_ip(config.ifname, ip, sizeof(ip));
-        json_object_object_add(jobj,"machine_ip", json_object_new_string(ip));
     } else if (0 == strcmp(recv_command, "get_detail")) { // query device status
    	    json_object_object_add(jobj,"command", json_object_new_string(recv_command));
     	json_object_object_add(jobj,"sign", json_object_new_string(recv_sign));
@@ -1105,7 +1150,7 @@ static int process_logic(json_object *jobj, const char *recv_command, const char
         get_ip(config.ifname, ip, sizeof(ip));
         json_object_object_add(jobj,"machine_ip", json_object_new_string(ip));
         json_object_object_add(jobj,"use_status", json_object_new_string(g_use_status));    
-        json_object_object_add(jobj,"charging_type", json_object_new_string(g_charging_type));
+        json_object_object_add(jobj,KEYNAME_CHARGING_TYPE, json_object_new_string(g_charging_type));
         json_object_object_add(jobj,"charging_time_s", json_object_new_string(g_charging_time_s));
         json_object_object_add(jobj,"charging_time_e", json_object_new_string(g_charging_time_e));
         json_object_object_add(jobj,"report_time", json_object_new_string(DEFAULT_REPORT_TIMEOUT));
@@ -1118,14 +1163,11 @@ static int process_logic(json_object *jobj, const char *recv_command, const char
             debug(LOG_ERR, "%s no gap_no\n", __func__);
             return -1;
         }
-
-        json_object_object_get_ex(recv_jobj, "server_url", &retobj);
-        recv_item = json_object_get_string(retobj);
-        if (NULL == recv_item) {
-            debug(LOG_ERR, "%s no server_url\n", __func__);
+        if (0 != strcmp(recv_item, g_gap_no)) {
+            debug(LOG_ERR, "%s %s!=%s\n", __func__, recv_item, g_gap_no);
             return -1;
         }
-
+        
    	    json_object_object_add(jobj,"command", json_object_new_string(recv_command));
     	json_object_object_add(jobj,"sign", json_object_new_string(recv_sign));
     	json_object_object_add(jobj,"result", json_object_new_string(g_result));
@@ -1152,13 +1194,14 @@ static int process_logic(json_object *jobj, const char *recv_command, const char
         }
         snprintf(signkey, sizeof(signkey), "%s", recv_item);
 
-        json_object_object_get_ex(recv_jobj, "charging_type", &retobj);
+        json_object_object_get_ex(recv_jobj, KEYNAME_CHARGING_TYPE, &retobj);
          recv_item = json_object_get_string(retobj);
          if (NULL == recv_item) {
              debug(LOG_ERR, "%s no charging_type\n", __func__);
              return -1;
          }
          snprintf(g_charging_type, sizeof(g_charging_type), "%s", recv_item);
+         set_data(KEYNAME_CHARGING_TYPE, g_charging_type);
 
         json_object_object_get_ex(recv_jobj, "charging_time_s", &retobj);
          recv_item = json_object_get_string(retobj);
@@ -1166,16 +1209,18 @@ static int process_logic(json_object *jobj, const char *recv_command, const char
              debug(LOG_ERR, "%s no charging_time_s\n", __func__);
              return -1;
          }
-         snprintf(g_charging_time_s, sizeof(g_charging_time_s), "%s", recv_item);
-
+        snprintf(g_charging_time_s, sizeof(g_charging_time_s), "%s", recv_item);
+        set_data(KEYNAME_CHARGING_TIME_S, g_charging_time_s);
+        
         json_object_object_get_ex(recv_jobj, "charging_time_e", &retobj);
          recv_item = json_object_get_string(retobj);
          if (NULL == recv_item) {
              debug(LOG_ERR, "%s no charging_time_e\n", __func__);
              return -1;
          }
-         snprintf(g_charging_time_e, sizeof(g_charging_time_e), "%s", recv_item);
-
+        snprintf(g_charging_time_e, sizeof(g_charging_time_e), "%s", recv_item);
+        set_data(KEYNAME_CHARGING_TIME_E, g_charging_time_e);
+        
         json_object_object_get_ex(recv_jobj, "use_status", &retobj);
         recv_item = json_object_get_string(retobj);
         if (NULL == recv_item) {
@@ -1191,7 +1236,8 @@ static int process_logic(json_object *jobj, const char *recv_command, const char
             return -1;
         }
         snprintf(g_pour_timeout, sizeof(g_pour_timeout), "%s", recv_item);
-       
+        set_data(KEYNAME_POUR_TIMEOUT, g_pour_timeout);
+
   	    json_object_object_add(jobj,"command", json_object_new_string(recv_command));
     	json_object_object_add(jobj,"sign", json_object_new_string(recv_sign));
     	json_object_object_add(jobj,"result", json_object_new_string(g_result));
@@ -1205,7 +1251,12 @@ static int process_logic(json_object *jobj, const char *recv_command, const char
             debug(LOG_ERR, "%s no gap_no\n", __func__);
             return -1;
         }
-        snprintf(g_gap_no, sizeof(g_gap_no), "%s", recv_item);
+        
+        if (0 != strcmp(g_gap_no, recv_item)) {
+            debug(LOG_ERR, "%s %s!=%s\n", __func__, g_gap_no, recv_item);
+            return -1;
+        }
+        //snprintf(g_gap_no, sizeof(g_gap_no), "%s", recv_item);
         
         json_object_object_get_ex(recv_jobj, "water_time", &retobj);
         recv_item = json_object_get_string(retobj);
@@ -1226,8 +1277,7 @@ static int process_logic(json_object *jobj, const char *recv_command, const char
             start_pour |= 1; 
         }
 
-        if (0 == strcmp(g_charging_type, CHARDING_TYPE_PERIOD)) {
-            // TODO time range check
+        if (0 == strcmp(g_charging_type, CHARGING_TYPE_PERIOD)) {
             t = time(NULL);
             timeinfo = localtime(&t);
             strftime(buffer, sizeof(buffer), "%Y%m%d%H%M", timeinfo);
@@ -1242,19 +1292,19 @@ static int process_logic(json_object *jobj, const char *recv_command, const char
         if (g_water_processing) { // only support one 
             snprintf(g_result, sizeof(g_result), "%s", RESULT_ABNORMAL);
             snprintf(g_errorcode, sizeof(g_errorcode), "%s,%s", g_errorcode, "PROCESSING");
-            snprintf(g_use_status, sizeof(g_use_status), "%s", USE_STATUS_PROCESSING);
             start_pour |= 4;
         } 
 
-        if (0 == start_pour) {
+        if (0 == start_pour) {// start thread
             pthread_mutex_lock(&processing_mutex);
-             g_water_processing = 1;
-             pthread_mutex_unlock(&processing_mutex);
-             snprintf(g_result, sizeof(g_result), "%s", RESULT_NORMAL);
-             snprintf(g_errorcode, sizeof(g_errorcode), "%s", "");
-             snprintf(g_use_status, sizeof(g_use_status), "%s", USE_STATUS_NORMAL);
-            
-            ret = pthread_create(&pourthread, 0 , pourthreadfunc, &water_time);
+            g_water_processing = 1;
+            snprintf(g_use_status, sizeof(g_use_status), "%s", USE_STATUS_PROCESSING);
+            pthread_mutex_unlock(&processing_mutex);
+            snprintf(g_result, sizeof(g_result), "%s", RESULT_NORMAL);
+            snprintf(g_errorcode, sizeof(g_errorcode), "%s", "");
+            g_water_time = water_time;
+            debug(LOG_DEBUG, "start POUR thread option=%d\n", g_water_time);
+            ret = pthread_create(&pourthread, 0 , pourthreadfunc, &g_water_time);
             if ( 0 != ret) {
                 debug(LOG_ERR, "therea create fail %d", ret);    
                 return -1;
@@ -1272,7 +1322,7 @@ static int process_logic(json_object *jobj, const char *recv_command, const char
         json_object_object_add(jobj,"use_status", json_object_new_string(g_use_status));
         json_object_object_add(jobj,"device_status", json_object_new_string(g_device_status));
         //sleep(150);
-    } else if (0 == strcmp(recv_command, "report_water")) {// for local test
+    } else if (0 == strcmp(recv_command, COMMANDNAME_REPORT_WATER)) {// for local test
   	    json_object_object_add(jobj,"command", json_object_new_string(recv_command));
     	json_object_object_add(jobj,"sign", json_object_new_string(recv_sign));
     	json_object_object_add(jobj,"result", json_object_new_string(g_result));
@@ -1302,7 +1352,7 @@ static int process_logic(json_object *jobj, const char *recv_command, const char
 #endif
 
 	json_string = json_object_to_json_string(jobj);
-	debug(LOG_DEBUG, "JSON_NEW: '%s' len=%lu\n", json_string, strlen(json_string));
+	debug(LOG_DEBUG, "-%s CMD=%s JSON_NEW='%s' len=%lu\n", __func__, recv_command, json_string, strlen(json_string));
 
     return 0;
 }
@@ -1440,14 +1490,14 @@ static int http_callback(void *cls,
     return MHD_YES;
   } else {// status = true;
     if(*upload_data_size != 0) {
-        debug(LOG_DEBUG, "size=%lu data=%s\n", *upload_data_size, upload_data);
+        debug(LOG_DEBUG, "size=%lu recvdata=%s\n", *upload_data_size, upload_data);
         post->buff = malloc(*upload_data_size + 1);
         
         snprintf(post->buff, *upload_data_size + 1,"%s",upload_data);
         *upload_data_size = 0;
         return MHD_YES;
     } else {
-        debug(LOG_DEBUG, "Get Postdata: '%s' size=%lu\n",post->buff, strlen(post->buff));
+        debug(LOG_DEBUG, "Postdata='%s' size=%lu\n",post->buff, strlen(post->buff));
         // Get all post data and process the commands
         recv_json = json_tokener_parse(post->buff);
         if(post->buff != NULL)
@@ -1474,7 +1524,7 @@ static int http_callback(void *cls,
         // return error to restful client
         generate_json_error(jobj, 1);      
     } else {
-        debug(LOG_DEBUG, "%s recv_json: %s\n", __func__, json_object_to_json_string(recv_json));
+        debug(LOG_DEBUG, "%s recv_json='%s'\n", __func__, json_object_to_json_string(recv_json));
         jret = json_object_object_get_ex(recv_json, "command", &retobj);
         recv_command = json_object_get_string(retobj);
         jret = json_object_object_get_ex(recv_json, "sign", &retobj);
@@ -1583,9 +1633,11 @@ int handle_request(void *cls, struct MHD_Connection *connection,
 }
 #endif
 
-// send http POST to server
+// send http POST to server report_status command
 static int postip(char *url)
 {
+    unsigned char tmpkey[33];
+
     char ip[16];
     char hostname[HOST_NAME_MAX];
     const char *recv_item = NULL;
@@ -1626,22 +1678,17 @@ static int postip(char *url)
 
     jobj = json_object_new_object();
 
+    snprintf(tmpkey, sizeof(tmpkey), "%s", signkey);
     if (gethostname(hostname, sizeof(hostname)) != 0) {
         debug(LOG_ERR, "gethostname failed with %d\n", errno);
     }
-
-    gethostname(hostname, sizeof(hostname));
-    json_object_object_add(jobj,"command", json_object_new_string("report_status"));
-    json_object_object_add(jobj,"sign", json_object_new_string(signkey));
+    json_object_object_add(jobj,"command", json_object_new_string(COMMANDNAME_REPORT_STATUS));
+    json_object_object_add(jobj,"sign", json_object_new_string(tmpkey));
     json_object_object_add(jobj,"hardware_no", json_object_new_string(hostname));
     json_object_object_add(jobj,"machine_ip", json_object_new_string(ip));
     //TODO get device use_status and hardware status
-    if (g_water_processing)
-        json_object_object_add(jobj,"use_status", json_object_new_string("3"));
-    else
-        json_object_object_add(jobj,"use_status", json_object_new_string("1"));
-
-    json_object_object_add(jobj,"device_status", json_object_new_string("301"));
+    json_object_object_add(jobj, KEYNAME_USE_STATUS, json_object_new_string(g_use_status));
+    json_object_object_add(jobj,"device_status", json_object_new_string(g_device_status));
         
     debug(LOG_DEBUG, "json='%s', len=%lu\n", json_object_to_json_string(jobj), strlen(json_object_to_json_string(jobj)));
     debug(LOG_DEBUG, "url=%s\n", url);
@@ -1675,7 +1722,6 @@ static int postip(char *url)
     /* fetch the url */
     rcode = curl_easy_perform(ch);
 
-
     //rcode = curl_fetch_url(ch, url, cf);
     curl_easy_cleanup(ch);
     curl_slist_free_all(headers);
@@ -1695,7 +1741,7 @@ static int postip(char *url)
     /* check payload */
     if (cf->payload != NULL) {
         /* print result */
-        debug(LOG_DEBUG, "CURL Returned: %s len=%lu\n", cf->payload, strlen(cf->payload));
+        debug(LOG_DEBUG, "CURL Returned='%s' len=%lu\n", cf->payload, strlen(cf->payload));
         /* parse return */
         jobj = json_tokener_parse(cf->payload); //json_tokener_parse_verbose(cf->payload, &jerr);
         /* free payload */
@@ -1722,24 +1768,46 @@ static int postip(char *url)
     /* debugging */
     debug(LOG_DEBUG, "%s Parsed JSON: %s\n", __func__, json_object_to_json_string(jobj));
 
-    // parse config data from the JSON string
-    json_object_object_get_ex(jobj, "newsign", &retobj);
+    // key checking
+    json_object_object_get_ex(jobj, "sign", &retobj);
     recv_item = json_object_get_string(retobj);
     if (NULL == recv_item) {
         debug(LOG_ERR, "%s no new signkey\n", __func__);
         return 5;
     }
-    
-    memcpy(signkey, recv_item, sizeof(signkey) - 1);
-    debug(LOG_DEBUG, "newsign=%s signkey=%s\n", recv_item, signkey);
 
-    json_object_object_get_ex(jobj, "charging_type", &retobj);
+    if (0 != strcmp(recv_item, tmpkey)) {
+         debug(LOG_ERR, "recv_sign %s != %s!", recv_item, tmpkey);
+         return -1;       
+    }
+    
+    // parse config data from the JSON string
+    json_object_object_get_ex(jobj, "newsign", &retobj);
+    recv_item = json_object_get_string(retobj);
+    if (NULL == recv_item) {
+        debug(LOG_ERR, "%s no new newkey\n", __func__);
+        return 5;
+    }    
+    memcpy(signkey, recv_item, sizeof(signkey) - 1);
+    debug(LOG_DEBUG, "newsign=%s oldsignkey=%s\n", recv_item, tmpkey);
+
+    json_object_object_get_ex(jobj, "use_status", &retobj);
+    recv_item = json_object_get_string(retobj);
+    if (NULL == recv_item) {
+        debug(LOG_ERR, "%s no use_status\n", __func__);
+        return 5;
+    }
+    memcpy(g_use_status, recv_item, sizeof(g_use_status) - 1);
+    debug(LOG_DEBUG, "g_use_status=%s\n", recv_item);
+
+    json_object_object_get_ex(jobj, KEYNAME_CHARGING_TYPE, &retobj);
     recv_item = json_object_get_string(retobj);
     if (NULL == recv_item) {
         debug(LOG_ERR, "%s no charging_type\n", __func__);
         return 5;
     }
     memcpy(g_charging_type, recv_item, sizeof(g_charging_type) - 1);
+    set_data(KEYNAME_CHARGING_TYPE, g_charging_type);
     debug(LOG_DEBUG, "charging_type=%s\n", recv_item);
 
     json_object_object_get_ex(jobj, "charging_time_s", &retobj);
@@ -1749,18 +1817,29 @@ static int postip(char *url)
         return 5;
     }
     memcpy(g_charging_time_s, recv_item, sizeof(g_charging_time_s) - 1);
-    debug(LOG_DEBUG, "charging_time_s=%s\n", recv_item);
+    debug(LOG_DEBUG, "charging_time_s='%s'\n", recv_item);
+    set_data(KEYNAME_CHARGING_TIME_S, g_charging_time_s);
 
     json_object_object_get_ex(jobj, "charging_time_e", &retobj);
-     recv_item = json_object_get_string(retobj);
-     if (NULL == recv_item) {
-         debug(LOG_ERR, "%s no charging_time_e\n", __func__);
-         return 5;
-     }
-     memcpy(g_charging_time_e, recv_item, sizeof(g_charging_time_e) - 1);
-     debug(LOG_DEBUG, "charging_time_e=%s\n", recv_item);
+    recv_item = json_object_get_string(retobj);
+    if (NULL == recv_item) {
+        debug(LOG_ERR, "%s no charging_time_e\n", __func__);
+        return 5;
+    }
+    memcpy(g_charging_time_e, recv_item, sizeof(g_charging_time_e) - 1);
+    debug(LOG_DEBUG, "charging_time_e='%s'\n", recv_item);
+    set_data(KEYNAME_CHARGING_TIME_E, g_charging_time_e);
 
-
+    json_object_object_get_ex(jobj, "pour_timeout", &retobj);
+    recv_item = json_object_get_string(retobj);
+    if (NULL == recv_item) {
+        debug(LOG_ERR, "%s no pour_timeout\n", __func__);
+        return 5;
+    }
+    memcpy(g_pour_timeout, recv_item, sizeof(g_pour_timeout) - 1);
+    debug(LOG_DEBUG, "g_pour_timeout=%s\n", recv_item);
+    set_data(KEYNAME_POUR_TIMEOUT, g_pour_timeout);
+    
     if (jobj != NULL) {
         debug(LOG_DEBUG, "%s Free JSON\n", __func__);
         json_object_put(jobj);
@@ -1783,15 +1862,15 @@ static void *postthreadfunc(void *arg)
         if (check_ip()) { // IP changed, send the IP using orgsign
             memcpy(signkey, master_sign, sizeof(signkey));
             postip(config.serverurl);     
-        } else { // The same IP report heartbeat very 60 seconds
-            if ((count * config.interval) >= 60) {
+        } else { // The same IP report heartbeat very 600 seconds
+            if ((count * atoi(g_ipcheck_time)) >= 600) {
                 count = 0;
                 postip(config.serverurl);
             }
         }
         count++;
-        debug(LOG_DEBUG, "%s sleep %d", __func__, config.interval);        
-        sleep(config.interval);
+        debug(LOG_DEBUG, "%s sleep %d", __func__, atoi(g_ipcheck_time));        
+        sleep(atoi(g_ipcheck_time));
     }
 
     debug(LOG_DEBUG, "-%s", __func__);    
@@ -1868,22 +1947,54 @@ static int httpserver()
 int main(int argc, char  **argv)
 {
     int ret = 0;
+    char value[32] = "";
+
+    config_init();
+    config_dump();
+    parse_commandline(argc, argv);
+    config_dump();
+
+    snprintf(g_gap_no, sizeof(g_gap_no), "%s", "A0001AGAP001");
+
+    snprintf(g_server_url, sizeof(g_server_url), "%s", config.serverurl);
+    //get_data(key, value);
+    set_data(KEYNAME_SERVER_URL, g_server_url);
+
+    snprintf(g_ipcheck_time, sizeof(g_ipcheck_time), "%d", config.interval);
+    set_data(KEYNAME_REPORT_TIME, g_ipcheck_time);
 
     // TODO hardware checking
     snprintf(g_device_status, sizeof(g_device_status), "%s", HARDWARE_DEVICE_NORMAL);
-
-    // TODO query settings from DB    
-    snprintf(g_charging_type, sizeof(g_charging_type), "%s", CHARDING_TYPE_COUNT);
-    snprintf(g_charging_time_s, sizeof(g_charging_time_s), "%s", "201608121611");
-    snprintf(g_charging_time_e, sizeof(g_charging_time_e), "%s", "201609121611");    
-
     snprintf(g_result, sizeof(g_result), "%s", RESULT_NORMAL);
 
-    // TODO set status based on time period
-    snprintf(g_use_status, sizeof(g_use_status), "%s", USE_STATUS_NORMAL);
+    // TODO query settings from DB
+    ret = get_data(KEYNAME_CHARGING_TYPE, value);
+    if (ret || (0 == strlen(value))) {
+        snprintf(value, sizeof(value), "%s", CHARGING_TYPE_COUNT);        
+        set_data(KEYNAME_CHARGING_TYPE, value);
+    }
+    snprintf(g_charging_type, sizeof(g_charging_type), "%s", value);
 
-    snprintf(g_pour_timeout, sizeof(g_pour_timeout), "%s", DEFAULT_POUR_TIMEOUT);
+    ret = get_data(KEYNAME_CHARGING_TIME_S, value);
+    snprintf(g_charging_time_s, sizeof(g_charging_time_s), "%s", value);
 
+    ret = get_data(KEYNAME_CHARGING_TIME_E, value);
+    snprintf(g_charging_time_e, sizeof(g_charging_time_e), "%s", value);
+
+    ret = get_data(KEYNAME_USE_STATUS, value);
+    if (ret || (0 == strlen(value))) {
+        snprintf(value, sizeof(value), "%s", USE_STATUS_NORMAL);
+        set_data(KEYNAME_USE_STATUS, value);
+    }
+    snprintf(g_use_status, sizeof(g_use_status), "%s", value);
+
+    ret = get_data(KEYNAME_POUR_TIMEOUT, value);
+    if (ret || (0 == strlen(value))) {
+        snprintf(value, sizeof(value), "%s", DEFAULT_POUR_TIMEOUT);
+        set_data(KEYNAME_POUR_TIMEOUT, value);
+    }
+    snprintf(g_pour_timeout, sizeof(g_pour_timeout), "%s", value);
+    
     printf("%s\n", __func__);
     printf("%s tid=%lu\n", __func__, syscall(SYS_gettid));
 
@@ -1895,17 +2006,8 @@ int main(int argc, char  **argv)
     
     init_signals();
 
-    config_init();
-
-    config_dump();
     debug(LOG_NOTICE, "Client Built on %s-%s", __DATE__, __TIME__);
     debug(LOG_DEBUG, "Client Built on %s-%s", __DATE__, __TIME__);
-
-    parse_commandline(argc, argv);
-
-    config_dump();
-
-    snprintf(g_server_url, sizeof(g_server_url), "%s", config.serverurl);
 
     //debug(LOG_DEBUG, "start process for httpserver daemon=%d", config.daemon);
 	if (config.daemon) {
